@@ -1,4 +1,6 @@
-const PROMPT_VERSION = "v4.2-2025-12-28";
+"use strict";
+
+const PROMPT_VERSION = "v4.2-2025-12-30";
 
 const express = require("express");
 const cors = require("cors");
@@ -9,23 +11,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-console.log("OPENAI key loaded:", process.env.OPENAI_API_KEY?.slice(0, 12) + "...");
-console.log("PORT:", process.env.PORT);
-
-// 1) Healthcheck
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "MagicGiftAI backend",
-    time: new Date().toISOString(),
-    promptVersion: PROMPT_VERSION,
-  });
-});
-
-// 2) Home
-app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "MagicGiftAI backend running" });
-});
+// Logs safe (après déclaration)
+console.log("PROMPT_VERSION:", PROMPT_VERSION);
+console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
+console.log("PORT env:", process.env.PORT);
 
 // --- Util: extraire du texte proprement depuis Responses API ---
 function extractOutputText(data) {
@@ -91,6 +80,21 @@ CLÔTURE
 Si l’utilisateur dit qu’il a choisi : tu clos chaleureusement, sans relancer, sans nouvelle idée, sans question.
 `.trim();
 
+// 1) Healthcheck
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "MagicGiftAI backend",
+    time: new Date().toISOString(),
+    promptVersion: PROMPT_VERSION,
+  });
+});
+
+// 2) Home
+app.get("/", (req, res) => {
+  res.json({ status: "ok", service: "MagicGiftAI backend running" });
+});
+
 // 3) Chat endpoint
 app.post("/chat", async (req, res) => {
   try {
@@ -98,7 +102,7 @@ app.post("/chat", async (req, res) => {
     if (!userMessage) return res.status(400).json({ ok: false, error: "Missing 'message' in body" });
 
     if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY is not set in .env" });
+      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY is not set in env" });
     }
 
     const r = await fetch("https://api.openai.com/v1/responses", {
@@ -118,7 +122,7 @@ app.post("/chat", async (req, res) => {
     });
 
     const data = await r.json();
-    if (!r.ok) return res.status(500).json({ ok: false, error: data });
+    if (!r.ok) return res.status(500).json({ ok: false, error: data, promptVersion: PROMPT_VERSION });
 
     const answer = extractOutputText(data);
 
@@ -127,6 +131,7 @@ app.post("/chat", async (req, res) => {
         ok: false,
         error: "Empty answer from OpenAI (try again / check prompt & model).",
         raw: data?.id || null,
+        promptVersion: PROMPT_VERSION,
       });
     }
 
@@ -138,7 +143,7 @@ app.post("/chat", async (req, res) => {
 
     return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+    return res.status(500).json({ ok: false, error: err?.message || String(err), promptVersion: PROMPT_VERSION });
   }
 });
 

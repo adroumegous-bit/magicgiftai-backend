@@ -1,9 +1,3 @@
-<<<<<<< HEAD
-"use strict";
-
-=======
-console.log("PROMPT_VERSION:", PROMPT_VERSION);
->>>>>>> 3aa590c7d233d18bd8bda5154b7370521837430f
 const PROMPT_VERSION = "v4.2-2025-12-30";
 
 const express = require("express");
@@ -15,14 +9,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-<<<<<<< HEAD
+HEAD
 // Logs safe (après déclaration)
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
 console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
 console.log("PORT env:", process.env.PORT);
-=======
-console.log("OPENAI key loaded:", process.env.OPENAI_API_KEY?.slice(0, 12) + "...");
-console.log("PORT:", process.env.PORT);
 
 // 1) Healthcheck
 app.get("/health", (req, res) => {
@@ -41,7 +32,6 @@ app.get("/", (req, res) => {
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "MagicGiftAI backend running" });
 });
->>>>>>> 3aa590c7d233d18bd8bda5154b7370521837430f
 
 // --- Util: extraire du texte proprement depuis Responses API ---
 function extractOutputText(data) {

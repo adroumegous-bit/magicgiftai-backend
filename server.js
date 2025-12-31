@@ -1,3 +1,5 @@
+"use strict";
+
 const PROMPT_VERSION = "v4.2-2025-12-30";
 
 const express = require("express");
@@ -9,28 +11,10 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Logs safe (après déclaration)
+// Logs safe
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
 console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
 console.log("PORT env:", process.env.PORT);
-
-// 1) Healthcheck
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "MagicGiftAI backend",
-    time: new Date().toISOString(),
-    promptVersion: PROMPT_VERSION,
-  });
-});
-app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "MagicGiftAI backend running", promptVersion: PROMPT_VERSION });
-});
-
-// 2) Home
-app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "MagicGiftAI backend running" });
-});
 
 // --- Util: extraire du texte proprement depuis Responses API ---
 function extractOutputText(data) {
@@ -105,7 +89,6 @@ Tu termines par une question d’action.
 CLÔTURE
 Si l’utilisateur dit qu’il a choisi (“c’est bon”, “merci”, “je prends ça”) :
 tu clos chaleureusement, complice, sans nouvelle idée, sans question.
-
 `.trim();
 
 // 1) Healthcheck
@@ -115,22 +98,29 @@ app.get("/health", (req, res) => {
     service: "MagicGiftAI backend",
     time: new Date().toISOString(),
     promptVersion: PROMPT_VERSION,
+    portEnv: process.env.PORT || null,
   });
 });
 
 // 2) Home
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "MagicGiftAI backend running" });
+  res.json({
+    status: "ok",
+    service: "MagicGiftAI backend running",
+    promptVersion: PROMPT_VERSION,
+  });
 });
 
 // 3) Chat endpoint
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = (req.body?.message || "").trim();
-    if (!userMessage) return res.status(400).json({ ok: false, error: "Missing 'message' in body" });
+    if (!userMessage) {
+      return res.status(400).json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
+    }
 
     if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY is not set in env" });
+      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY is not set in env", promptVersion: PROMPT_VERSION });
     }
 
     const r = await fetch("https://api.openai.com/v1/responses", {
@@ -150,10 +140,11 @@ app.post("/chat", async (req, res) => {
     });
 
     const data = await r.json();
-    if (!r.ok) return res.status(500).json({ ok: false, error: data, promptVersion: PROMPT_VERSION });
+    if (!r.ok) {
+      return res.status(500).json({ ok: false, error: data, promptVersion: PROMPT_VERSION });
+    }
 
     const answer = extractOutputText(data);
-
     if (!answer) {
       return res.status(500).json({
         ok: false,
@@ -163,18 +154,17 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // Nettoyage léger pour affichage (au cas où)
-    const clean = String(answer)
-      .replace(/\\n/g, "\n")
-      .replace(/\u00a0/g, " ")
-      .trim();
-
+    const clean = String(answer).replace(/\\n/g, "\n").replace(/\u00a0/g, " ").trim();
     return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || String(err), promptVersion: PROMPT_VERSION });
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+      promptVersion: PROMPT_VERSION,
+    });
   }
 });
 
+// 4) Listen (important for Railway)
 const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
+app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`));

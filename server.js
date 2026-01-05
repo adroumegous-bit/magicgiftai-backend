@@ -10,6 +10,18 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+const rateLimit = require("express-rate-limit");
+
+// Limite simple par IP
+app.set("trust proxy", 1); // important sur Railway
+app.use(rateLimit({
+  windowMs: 60 * 1000,      // 1 minute
+  max: 30,                  // 30 requêtes/min/IP (ajuste)
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
+
+
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
 console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
 console.log("PORT env:", process.env.PORT);

@@ -1,17 +1,15 @@
 "use strict";
 
-const PROMPT_VERSION = "v4.2-2026-01-05";
+const PROMPT_VERSION = "v4.3-2026-01-05";
 
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
-
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Logs safe
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
 console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
 console.log("PORT env:", process.env.PORT);
@@ -21,13 +19,11 @@ function extractOutputText(data) {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
-
   const chunks =
     data?.output
       ?.flatMap((o) => o?.content || [])
-      ?.map((c) => c?.text)
+      ?.map((c) => c?.text || c?.refusal)
       ?.filter((t) => typeof t === "string" && t.trim().length > 0) || [];
-
   return chunks.join("\n").trim();
 }
 
@@ -89,7 +85,7 @@ CLÔTURE
 Si l’utilisateur dit qu’il a choisi : tu clos chaleureusement, complice, sans nouvelle idée, sans question.
 `.trim();
 
-function buildSystemPrompt() {
+function buildInstructions() {
   const variationKey = Math.floor(Math.random() * 1_000_000);
   return `${BASE_PROMPT}
 
@@ -98,7 +94,6 @@ Consigne: varie les axes (expérience / personnalisé / utile-qualité / surpris
 `;
 }
 
-// 1) Healthcheck
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -109,7 +104,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// 2) Home
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -118,22 +112,15 @@ app.get("/", (req, res) => {
   });
 });
 
-// 3) Chat endpoint
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = String(req.body?.message || "").trim();
     if (!userMessage) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
+      return res.status(400).json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
     }
-
     if (!process.env.OPENAI_API_KEY) {
-      return res
-        .status(500)
-        .json({ ok: false, error: "OPENAI_API_KEY is not set in env", promptVersion: PROMPT_VERSION });
+      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY is not set in env", promptVersion: PROMPT_VERSION });
     }
-
     if (typeof fetch !== "function") {
       return res.status(500).json({
         ok: false,
@@ -142,9 +129,9 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    // (optionnel) Historique si ton front l’envoie: [{role:'user'|'assistant', content:'...'}]
-    const rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
-    const history = rawHistory
+    // Historique attendu: [{role:'user'|'assistant', content:'...'}]
+    let rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
+    rawHistory = rawHistory
       .filter(
         (m) =>
           m &&
@@ -152,13 +139,19 @@ app.post("/chat", async (req, res) => {
           typeof m.content === "string" &&
           m.content.trim().length > 0
       )
-      .slice(-8)
-      .map((m) => ({
-        role: m.role,
-        content: [{ type: "input_text", text: m.content.trim() }],
-      }));
+      .slice(-10);
 
-    const systemPrompt = buildSystemPrompt();
+    // Si le front a déjà mis le message courant dans history, on le retire (évite doublon)
+    const last = rawHistory[rawHistory.length - 1];
+    if (last && last.role === "user" && last.content.trim() === userMessage) {
+      rawHistory = rawHistory.slice(0, -1);
+    }
+
+    // ✅ Easy message syntax (content string) → évite le bug input_text vs assistant
+    const inputItems = [
+      ...rawHistory.map((m) => ({ type: "message", role: m.role, content: m.content.trim() })),
+      { type: "message", role: "user", content: userMessage },
+    ];
 
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -168,11 +161,8 @@ app.post("/chat", async (req, res) => {
       },
       body: JSON.stringify({
         model: "gpt-4.1-mini",
-        input: [
-          { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
-          ...history,
-          { role: "user", content: [{ type: "input_text", text: userMessage }] },
-        ],
+        instructions: buildInstructions(),
+        input: inputItems,
         max_output_tokens: 650,
       }),
     });
@@ -203,6 +193,5 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// 4) Listen (important for Railway)
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`));

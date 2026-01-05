@@ -15,7 +15,7 @@ app.set("trust proxy", 1); // important sur Railway
 
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 30,             // 30 req/min/IP (ajuste)
+  max: 20,             // 30 req/min/IP (ajuste)
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: "Trop de requêtes. Réessaie dans 1 minute." },

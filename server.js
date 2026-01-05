@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v4.2-2025-12-30";
+const PROMPT_VERSION = "v4.2-2026-01-05";
 
 const express = require("express");
 const cors = require("cors");
@@ -32,7 +32,7 @@ function extractOutputText(data) {
 }
 
 // ✅ Prompt maître (SYSTEM)
-const systemPrompt = `
+const BASE_PROMPT = `
 Tu es MagicGiftAI, coach humain pour choisir un cadeau vite et bien.
 
 MISSION
@@ -89,6 +89,15 @@ CLÔTURE
 Si l’utilisateur dit qu’il a choisi : tu clos chaleureusement, complice, sans nouvelle idée, sans question.
 `.trim();
 
+function buildSystemPrompt() {
+  const variationKey = Math.floor(Math.random() * 1_000_000);
+  return `${BASE_PROMPT}
+
+Clé de variation: ${variationKey}
+Consigne: varie les axes (expérience / personnalisé / utile-qualité / surprise) sans mentionner la clé.
+`;
+}
+
 // 1) Healthcheck
 app.get("/health", (req, res) => {
   res.json({
@@ -112,14 +121,44 @@ app.get("/", (req, res) => {
 // 3) Chat endpoint
 app.post("/chat", async (req, res) => {
   try {
-    const userMessage = (req.body?.message || "").trim();
+    const userMessage = String(req.body?.message || "").trim();
     if (!userMessage) {
-      return res.status(400).json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
     }
 
     if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY is not set in env", promptVersion: PROMPT_VERSION });
+      return res
+        .status(500)
+        .json({ ok: false, error: "OPENAI_API_KEY is not set in env", promptVersion: PROMPT_VERSION });
     }
+
+    if (typeof fetch !== "function") {
+      return res.status(500).json({
+        ok: false,
+        error: "Global fetch is not available. Use Node 18+ (Railway) or install node-fetch.",
+        promptVersion: PROMPT_VERSION,
+      });
+    }
+
+    // (optionnel) Historique si ton front l’envoie: [{role:'user'|'assistant', content:'...'}]
+    const rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
+    const history = rawHistory
+      .filter(
+        (m) =>
+          m &&
+          (m.role === "user" || m.role === "assistant") &&
+          typeof m.content === "string" &&
+          m.content.trim().length > 0
+      )
+      .slice(-8)
+      .map((m) => ({
+        role: m.role,
+        content: [{ type: "input_text", text: m.content.trim() }],
+      }));
+
+    const systemPrompt = buildSystemPrompt();
 
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -131,6 +170,7 @@ app.post("/chat", async (req, res) => {
         model: "gpt-4.1-mini",
         input: [
           { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+          ...history,
           { role: "user", content: [{ type: "input_text", text: userMessage }] },
         ],
         max_output_tokens: 650,

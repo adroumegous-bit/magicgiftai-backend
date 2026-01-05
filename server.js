@@ -139,6 +139,11 @@ app.get("/", (req, res) => {
   });
 });
 
+// Ping (protégé par le rate-limit car sous /chat)
+app.get("/chat/ping", (req, res) => {
+  res.json({ ok: true, promptVersion: PROMPT_VERSION });
+});
+
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = String(req.body?.message || "").trim();

@@ -7,8 +7,10 @@ const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true }));
+app.options("*", cors({ origin: true })); // répond aux preflight
 app.use(express.json({ limit: "1mb" }));
+
 
 const rateLimit = require("express-rate-limit");
 app.set("trust proxy", 1); // important sur Railway
@@ -18,6 +20,7 @@ const chatLimiter = rateLimit({
   max: 20,             // 20 req/min/IP (ajuste)
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS", // ✅ CRITIQUE
   message: { ok: false, error: "Trop de requêtes. Réessaie dans 1 minute." },
 });
 

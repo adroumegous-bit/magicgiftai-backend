@@ -1,36 +1,39 @@
 "use strict";
 
-const PROMPT_VERSION = "v4.3-2026-01-05";
+const PROMPT_VERSION = "v4.4-2026-01-06";
 
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const app = express();
+
+// CORS + preflight
 app.use(cors({ origin: true }));
-app.options("*", cors({ origin: true })); // répond aux preflight
+app.options("*", cors({ origin: true }));
 app.use(express.json({ limit: "1mb" }));
 
-
-const rateLimit = require("express-rate-limit");
-app.set("trust proxy", 1); // important sur Railway
+// Rate limit (Railway)
+app.set("trust proxy", 1);
 
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 20,             // 20 req/min/IP (ajuste)
+  max: 20,             // 20 req/min/IP
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.method === "OPTIONS", // ✅ CRITIQUE
+  skip: (req) => req.method === "OPTIONS",
   message: { ok: false, error: "Trop de requêtes. Réessaie dans 1 minute." },
 });
 
 app.use("/chat", chatLimiter);
 
+// Logs safe
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
 console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
 console.log("PORT env:", process.env.PORT);
 
-// --- Util: extraire du texte proprement depuis Responses API ---
+// --- Util: extraire du texte depuis Responses API ---
 function extractOutputText(data) {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
@@ -92,7 +95,7 @@ RÈGLES DE QUALITÉ (anti-catalogue)
 - Tu adaptes au délai :
   - Si c’est “aujourd’hui/demain” : privilégie magasin + achat immédiat.
   - Si délai OK : autorise commande + personnalisation.
-- Tu évites de citer des noms de boutiques/sit es spécifiques sauf demande explicite.
+- Tu évites de citer des noms de boutiques/sites spécifiques sauf demande explicite.
 
 DÉROULÉ
 - Si infos suffisantes : tu proposes 2 pistes max, bien différentes, puis tu TRANCHE.
@@ -115,20 +118,7 @@ CLÔTURE
 Si l’utilisateur dit qu’il a choisi : tu clos chaleureusement, complice, sans nouvelle idée, sans question.
 `.trim();
 
-function buildInstructions() {
-  const variationKey = Math.floor(Math.random() * 1_000_000);
-  const pool = pickIdeaPool(variationKey, 22).map(x => `- ${x}`).join("\n");
-  return `${BASE_PROMPT}
-  BIBLIOTHÈQUE D'AXES (à utiliser)
-Tu dois choisir tes 2 pistes dans ce pool (2 catégories différentes). N’invente pas d’adresses/sit es.
-Pool du jour:
-${pool}
-
-Clé de variation: ${variationKey}
-Consigne: varie l’axe (expérience/personnalisé/utile premium/créatif/émotion…) sans mentionner la clé.
-
-  // --- Gift Idea Library (mécaniques cadeaux) ---
-// Garde ça "générique" (pas de marques, pas d'adresses).
+// --- Gift Idea Library (mécaniques cadeaux) ---
 const IDEA_LIBRARY = [
   "Expérience: atelier céramique / poterie",
   "Expérience: atelier cuisine (thème selon goûts)",
@@ -136,42 +126,37 @@ const IDEA_LIBRARY = [
   "Expérience: massage / spa (si ok pour la personne)",
   "Expérience: escape game / quiz room",
   "Expérience: billet spectacle local (humour, concert, théâtre)",
-  "Expérience: journée “micro-aventure” (rando + pique-nique stylé)",
+  "Expérience: journée micro-aventure (rando + pique-nique stylé)",
   "Personnalisé: illustration/portrait (style minimaliste)",
   "Personnalisé: carte des étoiles (date/lieu important)",
   "Personnalisé: carte de ville (lieu marquant) en poster",
   "Personnalisé: playlist + carte imprimée + QR code",
-  "Personnalisé: recette/famille (mini-livre de recettes relié)",
-  "Émotion: boîte “souvenirs” (photos + 5 mots + 1 objet symbole)",
+  "Personnalisé: mini-livre de recettes (famille / thème)",
+  "Émotion: boîte souvenirs (photos + 5 mots + 1 objet symbole)",
   "Émotion: lettre + capsule temporelle (à ouvrir dans 1 an)",
   "Utile premium: gourde/isotherme haut de gamme",
-  "Utile premium: sac / tote robuste (style sobre)",
   "Utile premium: trousse organisée (voyage/sport/bureau)",
   "Utile premium: lampe/veilleuse ambiance (design)",
-  "Créatif/DIY: kit initiation (broderie, bougie sculptée, linogravure)",
-  "Créatif/DIY: kit peinture numéros (si profil zen)",
+  "Créatif/DIY: kit initiation (broderie, linogravure, etc.)",
   "Créatif/DIY: kit jardinage intérieur (aromates, champignons)",
-  "Geek clean: objet “utile-tech” minimaliste (support, chargeur, tracker)",
+  "Geek clean: objet utile-tech minimaliste (support, chargeur, tracker)",
   "Sport: accessoire qualitatif lié au sport exact (pas gadget)",
-  "Voyage: organiseur passeport + étiquettes + mini check-list",
-  "Voyage: carte à gratter (pays/France) + marqueur",
-  "Lecture: livre + accessoire intelligent (marque-page cuir, pince-livre)",
-  "Cuisine: outil premium (selon profil: couteau, planche, moulin, etc.)",
-  "Café/thé: accessoire premium (moulin manuel, infuseur, tasse artisanale)",
-  "Déco: objet signature (vase design, affiche, mobile) selon style",
-  "Déco: “coin zen” (petit set cohérent: plaid + lumière douce)",
-  "Musique: vinyle/merch officiel + accessoire (si fan)",
-  "Jeu: jeu de société ciblé (coop, duel, party) selon personnalité",
+  "Voyage: organiseur + étiquettes + mini check-list",
+  "Lecture: livre + accessoire intelligent (marque-page, pince-livre)",
+  "Cuisine: outil premium ciblé (moulin, planche, couteau, etc.)",
+  "Café/thé: accessoire premium (infuseur, tasse artisanale, etc.)",
+  "Déco: objet signature (affiche, mobile, vase) selon style",
+  "Déco: coin zen cohérent (plaid + lumière douce)",
+  "Jeu: jeu de société ciblé selon personnalité (coop, duel, party)",
   "Couple: expérience à deux (atelier, activité douce, sortie)",
   "Petites attentions: 3 mini-cadeaux cohérents (thème unique)",
-  "Mode: accessoire qualitatif (ceinture, bonnet, foulard) si style connu",
-  "Bureau: upgrade setup (porte-stylo, support laptop, carnet premium…)",
+  "Bureau: upgrade setup (support laptop, rangement, carnet premium)",
 ];
 
-// RNG déterministe (seed) pour tirer un pool sans dépendre d'une lib
+// RNG déterministe (seed)
 function mulberry32(seed) {
   let t = seed >>> 0;
-  return function() {
+  return function () {
     t += 0x6D2B79F5;
     let r = Math.imul(t ^ (t >>> 15), 1 | t);
     r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
@@ -179,10 +164,9 @@ function mulberry32(seed) {
   };
 }
 
-function pickIdeaPool(seedInt, n = 20) {
+function pickIdeaPool(seedInt, n = 22) {
   const rand = mulberry32(seedInt || 1);
   const copy = IDEA_LIBRARY.slice();
-  // shuffle
   for (let i = copy.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
     [copy[i], copy[j]] = [copy[j], copy[i]];
@@ -190,11 +174,23 @@ function pickIdeaPool(seedInt, n = 20) {
   return copy.slice(0, Math.min(n, copy.length));
 }
 
+function buildInstructions() {
+  const variationKey = Math.floor(Math.random() * 1_000_000);
+  const pool = pickIdeaPool(variationKey, 22).map((x) => `- ${x}`).join("\n");
+
+  return `${BASE_PROMPT}
+
+BIBLIOTHÈQUE D'AXES (à utiliser)
+Tu dois choisir tes 2 pistes dans ce pool (2 catégories différentes). Ne cite pas d'adresses ni de sites spécifiques par défaut.
+Pool du jour:
+${pool}
+
 Clé de variation: ${variationKey}
-Consigne: varie les axes (expérience / personnalisé / utile-qualité / surprise) sans mentionner la clé.
+Consigne: varie l’axe (expérience/personnalisé/utile premium/créatif/émotion…) sans mentionner la clé.
 `;
 }
 
+// Routes
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -213,15 +209,16 @@ app.get("/", (req, res) => {
   });
 });
 
-// Ping (protégé par le rate-limit car sous /chat)
 app.get("/chat/ping", (req, res) => {
   res.json({ ok: true, promptVersion: PROMPT_VERSION });
 });
 
+// Chat endpoint
 app.post("/chat", async (req, res) => {
+  const t0 = Date.now();
+  const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
+
   try {
-    const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
-const t0 = Date.now();
     const userMessage = String(req.body?.message || "").trim();
     if (!userMessage) {
       return res.status(400).json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
@@ -249,13 +246,12 @@ const t0 = Date.now();
       )
       .slice(-10);
 
-    // Si le front a déjà mis le message courant dans history, on le retire (évite doublon)
+    // si le front a déjà mis le message courant dans history, on le retire
     const last = rawHistory[rawHistory.length - 1];
     if (last && last.role === "user" && last.content.trim() === userMessage) {
       rawHistory = rawHistory.slice(0, -1);
     }
 
-    // ✅ Easy message syntax (content string) → évite le bug input_text vs assistant
     const inputItems = [
       ...rawHistory.map((m) => ({ type: "message", role: m.role, content: m.content.trim() })),
       { type: "message", role: "user", content: userMessage },
@@ -275,40 +271,44 @@ const t0 = Date.now();
       }),
     });
 
-    const data = await r.json();
+    const data = await r.json().catch(() => ({}));
     if (!r.ok) {
-      return res.status(500).json({ ok: false, error: data, promptVersion: PROMPT_VERSION });
+      console.error("OpenAI error:", r.status, JSON.stringify(data));
+      return res.status(502).json({ ok: false, error: "Upstream error", promptVersion: PROMPT_VERSION });
     }
 
     const answer = extractOutputText(data);
     if (!answer) {
-      return res.status(500).json({
+      return res.status(502).json({
         ok: false,
-        error: "Empty answer from OpenAI (try again / check prompt & model).",
+        error: "Empty answer from OpenAI",
         raw: data?.id || null,
         promptVersion: PROMPT_VERSION,
       });
     }
 
     const clean = String(answer).replace(/\\n/g, "\n").replace(/\u00a0/g, " ").trim();
-    const ms = Date.now() - t0;
-console.log(JSON.stringify({
-  at: new Date().toISOString(),
-  route: "/chat",
-  sessionId,
-  ms,
-  promptVersion: PROMPT_VERSION,
-}));
 
-    return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION,sessionId });
+    const ms = Date.now() - t0;
+    console.log(JSON.stringify({
+      at: new Date().toISOString(),
+      route: "/chat",
+      sessionId,
+      ms,
+      promptVersion: PROMPT_VERSION,
+    }));
+
+    return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION, sessionId });
   } catch (err) {
+    console.error("[/chat] ERROR", err);
     return res.status(500).json({
       ok: false,
-      error: err?.message || String(err),
+      error: "Backend error",
       promptVersion: PROMPT_VERSION,
     });
   }
 });
 
+// Listen (Railway)
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`));

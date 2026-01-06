@@ -197,7 +197,7 @@ const t0 = Date.now();
         model: "gpt-4.1-mini",
         instructions: buildInstructions(),
         input: inputItems,
-        max_output_tokens: 650,
+        max_output_tokens: 450,
       }),
     });
 

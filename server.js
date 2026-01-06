@@ -114,7 +114,78 @@ Si l’utilisateur dit qu’il a choisi : tu clos chaleureusement, complice, san
 
 function buildInstructions() {
   const variationKey = Math.floor(Math.random() * 1_000_000);
+  const pool = pickIdeaPool(variationKey, 22).map(x => `- ${x}`).join("\n");
   return `${BASE_PROMPT}
+  BIBLIOTHÈQUE D'AXES (à utiliser)
+Tu dois choisir tes 2 pistes dans ce pool (2 catégories différentes). N’invente pas d’adresses/sit es.
+Pool du jour:
+${pool}
+
+Clé de variation: ${variationKey}
+Consigne: varie l’axe (expérience/personnalisé/utile premium/créatif/émotion…) sans mentionner la clé.
+
+  // --- Gift Idea Library (mécaniques cadeaux) ---
+// Garde ça "générique" (pas de marques, pas d'adresses).
+const IDEA_LIBRARY = [
+  "Expérience: atelier céramique / poterie",
+  "Expérience: atelier cuisine (thème selon goûts)",
+  "Expérience: cours découverte (photo, danse, yoga, escalade)",
+  "Expérience: massage / spa (si ok pour la personne)",
+  "Expérience: escape game / quiz room",
+  "Expérience: billet spectacle local (humour, concert, théâtre)",
+  "Expérience: journée “micro-aventure” (rando + pique-nique stylé)",
+  "Personnalisé: illustration/portrait (style minimaliste)",
+  "Personnalisé: carte des étoiles (date/lieu important)",
+  "Personnalisé: carte de ville (lieu marquant) en poster",
+  "Personnalisé: playlist + carte imprimée + QR code",
+  "Personnalisé: recette/famille (mini-livre de recettes relié)",
+  "Émotion: boîte “souvenirs” (photos + 5 mots + 1 objet symbole)",
+  "Émotion: lettre + capsule temporelle (à ouvrir dans 1 an)",
+  "Utile premium: gourde/isotherme haut de gamme",
+  "Utile premium: sac / tote robuste (style sobre)",
+  "Utile premium: trousse organisée (voyage/sport/bureau)",
+  "Utile premium: lampe/veilleuse ambiance (design)",
+  "Créatif/DIY: kit initiation (broderie, bougie sculptée, linogravure)",
+  "Créatif/DIY: kit peinture numéros (si profil zen)",
+  "Créatif/DIY: kit jardinage intérieur (aromates, champignons)",
+  "Geek clean: objet “utile-tech” minimaliste (support, chargeur, tracker)",
+  "Sport: accessoire qualitatif lié au sport exact (pas gadget)",
+  "Voyage: organiseur passeport + étiquettes + mini check-list",
+  "Voyage: carte à gratter (pays/France) + marqueur",
+  "Lecture: livre + accessoire intelligent (marque-page cuir, pince-livre)",
+  "Cuisine: outil premium (selon profil: couteau, planche, moulin, etc.)",
+  "Café/thé: accessoire premium (moulin manuel, infuseur, tasse artisanale)",
+  "Déco: objet signature (vase design, affiche, mobile) selon style",
+  "Déco: “coin zen” (petit set cohérent: plaid + lumière douce)",
+  "Musique: vinyle/merch officiel + accessoire (si fan)",
+  "Jeu: jeu de société ciblé (coop, duel, party) selon personnalité",
+  "Couple: expérience à deux (atelier, activité douce, sortie)",
+  "Petites attentions: 3 mini-cadeaux cohérents (thème unique)",
+  "Mode: accessoire qualitatif (ceinture, bonnet, foulard) si style connu",
+  "Bureau: upgrade setup (porte-stylo, support laptop, carnet premium…)",
+];
+
+// RNG déterministe (seed) pour tirer un pool sans dépendre d'une lib
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function() {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function pickIdeaPool(seedInt, n = 20) {
+  const rand = mulberry32(seedInt || 1);
+  const copy = IDEA_LIBRARY.slice();
+  // shuffle
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, Math.min(n, copy.length));
+}
 
 Clé de variation: ${variationKey}
 Consigne: varie les axes (expérience / personnalisé / utile-qualité / surprise) sans mentionner la clé.

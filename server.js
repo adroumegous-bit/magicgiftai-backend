@@ -15,7 +15,7 @@ app.set("trust proxy", 1); // important sur Railway
 
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 20,             // 30 req/min/IP (ajuste)
+  max: 20,             // 20 req/min/IP (ajuste)
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: "Trop de requêtes. Réessaie dans 1 minute." },
@@ -146,6 +146,8 @@ app.get("/chat/ping", (req, res) => {
 
 app.post("/chat", async (req, res) => {
   try {
+    const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
+const t0 = Date.now();
     const userMessage = String(req.body?.message || "").trim();
     if (!userMessage) {
       return res.status(400).json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
@@ -215,7 +217,16 @@ app.post("/chat", async (req, res) => {
     }
 
     const clean = String(answer).replace(/\\n/g, "\n").replace(/\u00a0/g, " ").trim();
-    return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION });
+    const ms = Date.now() - t0;
+console.log(JSON.stringify({
+  at: new Date().toISOString(),
+  route: "/chat",
+  sessionId,
+  ms,
+  promptVersion: PROMPT_VERSION,
+}));
+
+    return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION,sessionId });
   } catch (err) {
     return res.status(500).json({
       ok: false,

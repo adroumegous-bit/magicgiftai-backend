@@ -1,10 +1,12 @@
 "use strict";
 
-const PROMPT_VERSION = "v4.7-2026-01-07";
+const PROMPT_VERSION = "v4.8-2026-01-07";
 
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
+const { Pool } = require("pg");
 require("dotenv").config();
 
 const app = express();
@@ -32,6 +34,108 @@ app.use("/chat", chatLimiter);
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
 console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
 console.log("PORT env:", process.env.PORT);
+
+/* ==========================
+   METRICS DB (PostgreSQL)
+   ========================== */
+
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const SESSION_SALT = process.env.SESSION_SALT || "";
+
+let pgPool = null;
+let dbInitPromise = null;
+
+function requireAdmin(req, res, next) {
+  const key = req.get("x-admin-key") || req.query.key || "";
+  if (!ADMIN_KEY || key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
+  next();
+}
+
+function sessionHash(sessionId) {
+  const sid = String(sessionId || "no-session");
+  const salt = SESSION_SALT || "fallback-salt";
+  return crypto.createHmac("sha256", salt).update(sid).digest("hex").slice(0, 24);
+}
+
+function getPool() {
+  if (!DATABASE_URL) return null;
+  if (pgPool) return pgPool;
+
+  const isInternal = DATABASE_URL.includes("railway.internal");
+  pgPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: isInternal ? false : { rejectUnauthorized: false },
+  });
+
+  return pgPool;
+}
+
+async function initDb() {
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    const pool = getPool();
+    if (!pool) throw new Error("DB disabled (DATABASE_URL missing)");
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mg_events (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        session_hash TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        prompt_version TEXT,
+        ms INT,
+        meta JSONB NOT NULL DEFAULT '{}'::jsonb
+      );
+
+      CREATE INDEX IF NOT EXISTS mg_events_created_at_idx ON mg_events (created_at DESC);
+      CREATE INDEX IF NOT EXISTS mg_events_event_type_idx ON mg_events (event_type);
+      CREATE INDEX IF NOT EXISTS mg_events_session_hash_idx ON mg_events (session_hash);
+    `);
+
+    console.log("DB ready ✅");
+  })();
+
+  return dbInitPromise;
+}
+
+async function logEvent({ sessionId, eventType, ms = null, meta = {} }) {
+  try {
+    if (!SESSION_SALT) console.warn("SESSION_SALT missing -> using fallback-salt (set SESSION_SALT in Railway env).");
+    if (!ADMIN_KEY) console.warn("ADMIN_KEY missing -> admin endpoints locked (set ADMIN_KEY in Railway env).");
+
+    await initDb();
+    const pool = getPool();
+    if (!pool) return;
+
+    await pool.query(
+      `INSERT INTO mg_events (session_hash, event_type, prompt_version, ms, meta)
+       VALUES ($1,$2,$3,$4,$5::jsonb)`,
+      [
+        sessionHash(sessionId),
+        String(eventType),
+        PROMPT_VERSION,
+        ms === null ? null : Number(ms),
+        JSON.stringify(meta || {}),
+      ]
+    );
+  } catch (e) {
+    // ne bloque jamais le chat à cause des stats
+    console.error("logEvent failed:", e?.message || String(e));
+  }
+}
+
+// Feedback limiter (séparé)
+const feedbackLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS",
+  message: { ok: false, error: "Trop de feedback. Réessaie dans 1 minute." },
+});
+app.use("/feedback", feedbackLimiter);
 
 // --- Util: extraire du texte depuis Responses API ---
 function extractOutputText(data) {
@@ -237,19 +341,8 @@ const IDEA_BANK = [
   { cat: "utile", tags: ["sport"], urgentOk: true, min: 15, max: 90, text: "Une gourde sport souple/rigide adaptée à sa pratique" },
   { cat: "utile", tags: ["zen","deco"], urgentOk: true, min: 20, max: 160, text: "Une lumière d’ambiance design pour vibe zen (lampe/veilleuse)" },
   { cat: "utile", tags: ["zen","deco"], urgentOk: true, min: 15, max: 90, text: "Un plaid ultra doux (qualité) pour ‘coin cosy’ (pas déco kitsch)" },
-  { cat: "utile", tags: ["zen","deco"], urgentOk: true, min: 15, max: 80, text: "Un coussin lombaire/nuque ergonomique (si besoin)" },
-  { cat: "utile", tags: ["food"], urgentOk: true, min: 20, max: 200, text: "Un outil cuisine premium ciblé (moulin, planche, couteau… selon profil)" },
-  { cat: "utile", tags: ["food"], urgentOk: true, min: 20, max: 160, text: "Un moulin à poivre/sel manuel de qualité (sans marque)" },
-  { cat: "utile", tags: ["food"], urgentOk: true, min: 20, max: 160, text: "Une belle planche + huile d’entretien (si cuisine)" },
-  { cat: "utile", tags: ["food"], urgentOk: true, min: 20, max: 160, text: "Un couteau d’office qualitatif + affûteur simple" },
-  { cat: "utile", tags: ["food"], urgentOk: true, min: 15, max: 90, text: "Un thermomètre cuisine précis (cuissons, pâtisserie)" },
-  { cat: "utile", tags: ["food"], urgentOk: true, min: 20, max: 150, text: "Une cafetière ‘méthode douce’ + filtre réutilisable (si coffee nerd)" },
-  { cat: "utile", tags: ["food"], urgentOk: true, min: 15, max: 90, text: "Un infuseur/théière simple mais premium (si thé)" },
-  { cat: "utile", tags: ["culture","fun"], urgentOk: true, min: 15, max: 80, text: "Une liseuse de lecture ‘lumière clip’ + support livre (confort)" },
-  { cat: "utile", tags: ["culture","fun"], urgentOk: true, min: 15, max: 80, text: "Un puzzle adulte beau (illustration) – choisi selon goûts" },
-  { cat: "utile", tags: ["deco","zen"], urgentOk: true, min: 20, max: 160, text: "Un rangement discret pour entrée (vide-poches design, mais sobre)" },
+  { cat: "utile", tags: ["zen","deco"], urgentOk: true, min: 15, max: 120, text: "Un rangement discret pour entrée (vide-poches design, mais sobre)" },
   { cat: "utile", tags: ["deco","zen"], urgentOk: true, min: 20, max: 160, text: "Un cadre photo premium + impression (look galerie)" },
-  { cat: "utile", tags: ["deco","zen"], urgentOk: true, min: 15, max: 120, text: "Un set d’accessoires ‘salle de bain clean’ (porte-savon, rangement, sobre)" },
   { cat: "utile", tags: ["voyage"], urgentOk: true, min: 15, max: 80, text: "Un parapluie compact solide (anti-retournement) – utile toute l’année" },
 
   { cat: "creatif", tags: ["creatif"], urgentOk: true, min: 15, max: 120, text: "Un kit DIY linogravure (outils + blocs) pour créer des tampons" },
@@ -258,38 +351,15 @@ const IDEA_BANK = [
   { cat: "creatif", tags: ["creatif"], urgentOk: true, min: 15, max: 80, text: "Un kit calligraphie/brush lettering (2 feutres + guide)" },
   { cat: "creatif", tags: ["creatif","deco"], urgentOk: true, min: 20, max: 140, text: "Un kit poterie auto-durcissante + outils (création maison)" },
   { cat: "creatif", tags: ["creatif","zen"], urgentOk: true, min: 15, max: 90, text: "Un kit terrarium simple (plantes + bocal) à monter" },
-  { cat: "creatif", tags: ["creatif","food"], urgentOk: true, min: 15, max: 90, text: "Un kit cuisine ‘fait maison’ (ramen, pâtes, kimchi… selon goûts)" },
-  { cat: "creatif", tags: ["creatif"], urgentOk: true, min: 15, max: 80, text: "Un kit bougie sculptée (moules + cire) version design" },
-  { cat: "creatif", tags: ["creatif"], urgentOk: true, min: 15, max: 80, text: "Un kit cosmétique maison (baume, gommage) – si profil zen" },
-  { cat: "creatif", tags: ["creatif"], urgentOk: true, min: 15, max: 80, text: "Un kit ‘carnet de voyage’… mais version collage + stickers (créatif)" },
-  { cat: "creatif", tags: ["creatif"], urgentOk: true, min: 15, max: 100, text: "Un set ‘puzzle 3D / maquette’ (objet final déco)" },
-  { cat: "creatif", tags: ["creatif","culture"], urgentOk: true, min: 20, max: 160, text: "Un set initiation photo (mini trépied + déclencheur + guide)" },
-  { cat: "creatif", tags: ["creatif","zen"], urgentOk: true, min: 15, max: 90, text: "Un kit origami premium (papier + modèles) pour déconnecter" },
-  { cat: "creatif", tags: ["creatif","deco"], urgentOk: true, min: 15, max: 120, text: "Un set peinture sur céramique (à faire à la maison)" },
-  { cat: "creatif", tags: ["creatif","fun"], urgentOk: true, min: 20, max: 140, text: "Un set ‘initiation musique’ (kalimba/ukulélé simple) si ça lui parle" },
 
   { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 220, text: "Un objet déco signature (affiche, mobile, vase) aligné avec son style" },
   { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 25, max: 220, text: "Un mini ‘coin zen’ cohérent (plaid + lumière douce + petit élément)" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 180, text: "Un set de cadres minimalistes (1–3 cadres) pour une mini galerie murale" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 180, text: "Un miroir design simple (format entrée / chambre)" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 180, text: "Un mobile décoratif (métal/bois) pour une vibe zen" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 200, text: "Un vase contemporain (forme simple) + une tige/branche stylée" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 180, text: "Un tapis/paillasson intérieur sobre (texture) pour ‘upgrade’ la pièce" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 200, text: "Un panier/rangement tressé chic (anti-bazar, mais joli)" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 180, text: "Une plante d’intérieur facile + cache-pot sobre (si elle aime le vert)" },
-  { cat: "deco", tags: ["deco","zen"], urgentOk: true, min: 20, max: 200, text: "Un set ‘table’ minimal (dessous de verre/petit plateau) style zen" },
 
   { cat: "tech", tags: ["tech","bureau"], urgentOk: true, min: 20, max: 120, text: "Un support de charge multi-appareils (setup clean, sans marque)" },
-  { cat: "tech", tags: ["tech","bureau"], urgentOk: true, min: 25, max: 220, text: "Un casque/écouteurs confort (si elle écoute musique/podcasts)" },
-  { cat: "tech", tags: ["tech","bureau"], urgentOk: true, min: 20, max: 160, text: "Une mini enceinte compacte (pour maison/voyage)" },
   { cat: "tech", tags: ["tech","bureau"], urgentOk: true, min: 15, max: 90, text: "Un hub USB/organisateur de câbles (bureau propre)" },
-  { cat: "tech", tags: ["tech","bureau"], urgentOk: true, min: 20, max: 150, text: "Un clavier/souris ergonomiques (si beaucoup de bureau)" },
 
   { cat: "culture", tags: ["culture","fun"], urgentOk: true, min: 15, max: 80, text: "Un livre vraiment ciblé + un accessoire lecture (pince-livre / marque-page premium)" },
   { cat: "culture", tags: ["culture","fun"], urgentOk: true, min: 15, max: 90, text: "Un jeu narratif / enquête à faire à la maison (choisi selon style)" },
-  { cat: "culture", tags: ["culture","fun"], urgentOk: true, min: 20, max: 160, text: "Un pass musée/expo (carte cadeau officielle) – version locale" },
-  { cat: "culture", tags: ["culture","fun"], urgentOk: true, min: 15, max: 90, text: "Un puzzle illustré ‘beau’ (à exposer ou encadrer)" },
-  { cat: "culture", tags: ["culture","fun"], urgentOk: true, min: 20, max: 160, text: "Un cours en ligne court (photo, cuisine, dessin) à suivre à son rythme" },
 ];
 
 function mulberry32(seed) {
@@ -425,6 +495,7 @@ app.get("/health", (req, res) => {
     time: new Date().toISOString(),
     promptVersion: PROMPT_VERSION,
     portEnv: process.env.PORT || null,
+    dbEnabled: Boolean(DATABASE_URL),
   });
 });
 
@@ -438,6 +509,40 @@ app.get("/", (req, res) => {
 
 app.get("/chat/ping", (req, res) => {
   res.json({ ok: true, promptVersion: PROMPT_VERSION });
+});
+
+// Admin: test DB
+app.get("/admin/db-ping", requireAdmin, async (req, res) => {
+  try {
+    await initDb();
+    const pool = getPool();
+    if (!pool) return res.status(500).json({ ok: false, error: "DB disabled (DATABASE_URL missing)" });
+    const r = await pool.query("SELECT now() AS now");
+    res.json({ ok: true, now: r.rows[0].now, promptVersion: PROMPT_VERSION });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Public: feedback (valid/invalid) => pour tes courbes
+app.post("/feedback", async (req, res) => {
+  try {
+    const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
+    const verdict = String(req.body?.verdict || "").toLowerCase().trim();
+
+    if (!["valid", "invalid"].includes(verdict)) {
+      return res.status(400).json({ ok: false, error: "verdict must be 'valid' or 'invalid'" });
+    }
+
+    void logEvent({
+      sessionId,
+      eventType: verdict === "valid" ? "feedback_valid" : "feedback_invalid",
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Backend error" });
+  }
 });
 
 app.post("/chat", async (req, res) => {
@@ -459,6 +564,9 @@ app.post("/chat", async (req, res) => {
         promptVersion: PROMPT_VERSION,
       });
     }
+
+    // log request (non bloquant)
+    void logEvent({ sessionId, eventType: "chat_request", meta: { len: userMessage.length } });
 
     let rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
     rawHistory = rawHistory
@@ -501,12 +609,16 @@ app.post("/chat", async (req, res) => {
 
     const data = await r.json().catch(() => ({}));
     if (!r.ok) {
+      const msErr = Date.now() - t0;
       console.error("OpenAI error:", r.status, JSON.stringify(data));
+      void logEvent({ sessionId, eventType: "chat_upstream_error", ms: msErr, meta: { status: r.status } });
       return res.status(502).json({ ok: false, error: "Upstream error", promptVersion: PROMPT_VERSION });
     }
 
     const answer = extractOutputText(data);
     if (!answer) {
+      const msErr = Date.now() - t0;
+      void logEvent({ sessionId, eventType: "chat_empty_answer", ms: msErr });
       return res.status(502).json({
         ok: false,
         error: "Empty answer from OpenAI",
@@ -528,9 +640,15 @@ app.post("/chat", async (req, res) => {
       })
     );
 
+    // log response (non bloquant)
+    void logEvent({ sessionId, eventType: "chat_response", ms });
+
     return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION, sessionId });
   } catch (err) {
+    const msErr = Date.now() - t0;
     console.error("[/chat] ERROR", err);
+    void logEvent({ sessionId, eventType: "chat_backend_error", ms: msErr });
+
     return res.status(500).json({
       ok: false,
       error: "Backend error",

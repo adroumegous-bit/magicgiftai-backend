@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v4.6-2026-01-07";
+const PROMPT_VERSION = "v4.7-2026-01-07";
 
 const express = require("express");
 const cors = require("cors");

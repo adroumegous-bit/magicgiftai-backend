@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v4.8-2026-01-07";
+const PROMPT_VERSION = "v4.9-2026-01-08";
 
 const express = require("express");
 const cors = require("cors");
@@ -29,6 +29,101 @@ const chatLimiter = rateLimit({
 });
 
 app.use("/chat", chatLimiter);
+
+/* ==========================
+   CONVERSION TRACKING (Option 2)
+   - POST /event : conv_validated / conv_invalidated
+   - log dans Postgres table mg_events (session_hash + event_type + prompt_version)
+   ========================== */
+const MG_METRICS = (() => {
+  const crypto = require("crypto");
+  const { Pool } = require("pg");
+
+  const DB_URL =
+    process.env.DATABASE_URL ||
+    process.env.DATABASE_PRIVATE_URL ||
+    process.env.POSTGRES_URL ||
+    null;
+
+  const SESSION_SALT = String(process.env.SESSION_SALT || "dev-salt");
+  const PROMPT_VERSION_SAFE = typeof PROMPT_VERSION === "string" ? PROMPT_VERSION : "unknown";
+
+  const pool = DB_URL
+    ? new Pool({
+        connectionString: DB_URL,
+        // Railway: souvent SSL requis côté driver, mais tolère false en interne.
+        ssl: DB_URL.includes("rlwy") || DB_URL.includes("proxy") ? { rejectUnauthorized: false } : undefined,
+      })
+    : null;
+
+  function sessionHash(sessionId) {
+    const raw = String(sessionId || "no-session").slice(0, 200);
+    // hash court comme dans ta table (ex: 24 chars hex)
+    return crypto.createHmac("sha256", SESSION_SALT).update(raw).digest("hex").slice(0, 24);
+  }
+
+  async function ensureTable() {
+    if (!pool) return false;
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mg_events (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        session_hash TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        prompt_version TEXT NOT NULL
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mg_events_created_at ON mg_events(created_at);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mg_events_type ON mg_events(event_type);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mg_events_session ON mg_events(session_hash);`);
+    return true;
+  }
+
+  async function logEvent(eventType, sessionId) {
+    if (!pool) return;
+    const sh = sessionHash(sessionId);
+    await pool.query(
+      `INSERT INTO mg_events(session_hash, event_type, prompt_version) VALUES ($1, $2, $3)`,
+      [sh, String(eventType || "unknown").slice(0, 80), PROMPT_VERSION_SAFE]
+    );
+  }
+
+  return { ensureTable, logEvent, hasDb: () => Boolean(pool) };
+})();
+
+// Init DB (silencieux si pas de DB_URL)
+MG_METRICS.ensureTable()
+  .then((ok) => {
+    if (ok) console.log("DB events table ready ✅");
+    else console.log("DB disabled (no DATABASE_URL) ⚠️");
+  })
+  .catch((e) => console.error("DB init error:", e?.message || e));
+
+/* ---- Route conversion (frontend buttons) ---- */
+app.post("/event", async (req, res) => {
+  try {
+    // attend: { sessionId, type }
+    const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
+    const type = String(req.body?.type || "").trim();
+
+    // verrou: on n'accepte QUE ces deux events (sinon spam/garbage)
+    const allowed = new Set(["conv_validated", "conv_invalidated"]);
+    if (!allowed.has(type)) {
+      return res.status(400).json({ ok: false, error: "Invalid event type" });
+    }
+
+    // log en DB si dispo
+    if (MG_METRICS.hasDb()) {
+      await MG_METRICS.logEvent(type, sessionId);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[/event] ERROR", e);
+    return res.status(500).json({ ok: false, error: "Backend error" });
+  }
+});
+
 
 // Logs safe
 console.log("PROMPT_VERSION:", PROMPT_VERSION);

@@ -1,6 +1,7 @@
+
 "use strict";
 
-const PROMPT_VERSION = "v4.9-2026-01-08";
+const PROMPT_VERSION = "v4.10-2026-01-08";
 
 const express = require("express");
 const cors = require("cors");
@@ -27,103 +28,19 @@ const chatLimiter = rateLimit({
   skip: (req) => req.method === "OPTIONS",
   message: { ok: false, error: "Trop de requêtes. Réessaie dans 1 minute." },
 });
-
 app.use("/chat", chatLimiter);
 
-/* ==========================
-   CONVERSION TRACKING (Option 2)
-   - POST /event : conv_validated / conv_invalidated
-   - log dans Postgres table mg_events (session_hash + event_type + prompt_version)
-   ========================== */
-const MG_METRICS = (() => {
-  const crypto = require("crypto");
-  const { Pool } = require("pg");
-
-  const DB_URL =
-    process.env.DATABASE_URL ||
-    process.env.DATABASE_PRIVATE_URL ||
-    process.env.POSTGRES_URL ||
-    null;
-
-  const SESSION_SALT = String(process.env.SESSION_SALT || "dev-salt");
-  const PROMPT_VERSION_SAFE = typeof PROMPT_VERSION === "string" ? PROMPT_VERSION : "unknown";
-
-  const pool = DB_URL
-    ? new Pool({
-        connectionString: DB_URL,
-        // Railway: souvent SSL requis côté driver, mais tolère false en interne.
-        ssl: DB_URL.includes("rlwy") || DB_URL.includes("proxy") ? { rejectUnauthorized: false } : undefined,
-      })
-    : null;
-
-  function sessionHash(sessionId) {
-    const raw = String(sessionId || "no-session").slice(0, 200);
-    // hash court comme dans ta table (ex: 24 chars hex)
-    return crypto.createHmac("sha256", SESSION_SALT).update(raw).digest("hex").slice(0, 24);
-  }
-
-  async function ensureTable() {
-    if (!pool) return false;
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS mg_events (
-        id BIGSERIAL PRIMARY KEY,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        session_hash TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        prompt_version TEXT NOT NULL
-      );
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mg_events_created_at ON mg_events(created_at);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mg_events_type ON mg_events(event_type);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_mg_events_session ON mg_events(session_hash);`);
-    return true;
-  }
-
-  async function logEvent(eventType, sessionId) {
-    if (!pool) return;
-    const sh = sessionHash(sessionId);
-    await pool.query(
-      `INSERT INTO mg_events(session_hash, event_type, prompt_version) VALUES ($1, $2, $3)`,
-      [sh, String(eventType || "unknown").slice(0, 80), PROMPT_VERSION_SAFE]
-    );
-  }
-
-  return { ensureTable, logEvent, hasDb: () => Boolean(pool) };
-})();
-
-// Init DB (silencieux si pas de DB_URL)
-MG_METRICS.ensureTable()
-  .then((ok) => {
-    if (ok) console.log("DB events table ready ✅");
-    else console.log("DB disabled (no DATABASE_URL) ⚠️");
-  })
-  .catch((e) => console.error("DB init error:", e?.message || e));
-
-/* ---- Route conversion (frontend buttons) ---- */
-app.post("/event", async (req, res) => {
-  try {
-    // attend: { sessionId, type }
-    const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
-    const type = String(req.body?.type || "").trim();
-
-    // verrou: on n'accepte QUE ces deux events (sinon spam/garbage)
-    const allowed = new Set(["conv_validated", "conv_invalidated"]);
-    if (!allowed.has(type)) {
-      return res.status(400).json({ ok: false, error: "Invalid event type" });
-    }
-
-    // log en DB si dispo
-    if (MG_METRICS.hasDb()) {
-      await MG_METRICS.logEvent(type, sessionId);
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[/event] ERROR", e);
-    return res.status(500).json({ ok: false, error: "Backend error" });
-  }
+// limiter événements (vote/feedback)
+const eventLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method === "OPTIONS",
+  message: { ok: false, error: "Trop de feedback. Réessaie dans 1 minute." },
 });
-
+app.use("/event", eventLimiter);
+app.use("/feedback", eventLimiter);
 
 // Logs safe
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
@@ -131,12 +48,12 @@ console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12
 console.log("PORT env:", process.env.PORT);
 
 /* ==========================
-   METRICS DB (PostgreSQL)
+   DB / METRICS (PostgreSQL)
    ========================== */
 
-const DATABASE_URL = process.env.DATABASE_URL || "";
+const DATABASE_URL = process.env.DATABASE_URL || process.env.DATABASE_PRIVATE_URL || process.env.POSTGRES_URL || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
-const SESSION_SALT = process.env.SESSION_SALT || "";
+const SESSION_SALT = process.env.SESSION_SALT || "fallback-salt";
 
 let pgPool = null;
 let dbInitPromise = null;
@@ -147,10 +64,20 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+function hmac24(raw) {
+  return crypto.createHmac("sha256", SESSION_SALT).update(String(raw || "")).digest("hex").slice(0, 24);
+}
+
 function sessionHash(sessionId) {
-  const sid = String(sessionId || "no-session");
-  const salt = SESSION_SALT || "fallback-salt";
-  return crypto.createHmac("sha256", salt).update(sid).digest("hex").slice(0, 24);
+  const sid = String(sessionId || "no-session").slice(0, 200);
+  return hmac24(sid);
+}
+
+// 1 conversation = 1 recherche (revote possible quand conversationId change)
+function conversationHash(conversationId, sessionId) {
+  // fallback: si front pas à jour, on retombe sur sessionId (=> comportement "1 vote / session")
+  const raw = String(conversationId || sessionId || "no-conv").slice(0, 200);
+  return hmac24(raw);
 }
 
 function getPool() {
@@ -162,7 +89,6 @@ function getPool() {
     connectionString: DATABASE_URL,
     ssl: isInternal ? false : { rejectUnauthorized: false },
   });
-
   return pgPool;
 }
 
@@ -173,66 +99,128 @@ async function initDb() {
     const pool = getPool();
     if (!pool) throw new Error("DB disabled (DATABASE_URL missing)");
 
+    // Table compatible (ancienne + nouvelle)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS mg_events (
         id BIGSERIAL PRIMARY KEY,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         session_hash TEXT NOT NULL,
+        conversation_hash TEXT,
         event_type TEXT NOT NULL,
         prompt_version TEXT,
         ms INT,
         meta JSONB NOT NULL DEFAULT '{}'::jsonb
       );
-
-      CREATE INDEX IF NOT EXISTS mg_events_created_at_idx ON mg_events (created_at DESC);
-      CREATE INDEX IF NOT EXISTS mg_events_event_type_idx ON mg_events (event_type);
-      CREATE INDEX IF NOT EXISTS mg_events_session_hash_idx ON mg_events (session_hash);
     `);
 
-    console.log("DB ready ✅");
+    // Ajout colonnes si table existait déjà sans
+    await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS conversation_hash TEXT;`);
+    await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS prompt_version TEXT;`);
+    await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS ms INT;`);
+    await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+
+    // Index
+    await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_created_at_idx ON mg_events (created_at DESC);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_event_type_idx ON mg_events (event_type);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_session_hash_idx ON mg_events (session_hash);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_conversation_hash_idx ON mg_events (conversation_hash);`);
+
+    // Unicité 1 vote par conversation (peut échouer si vieux doublons -> on ne casse pas le serveur)
+    try {
+      await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS mg_one_vote_per_conversation
+        ON mg_events (conversation_hash)
+        WHERE event_type IN ('conv_validated','conv_invalidated');
+      `);
+      console.log("DB ready ✅ (index vote unique ok)");
+    } catch (e) {
+      console.warn("DB ready ✅ (index vote unique NON créé - doublons existants ?)", e?.message || e);
+    }
   })();
 
   return dbInitPromise;
 }
 
-async function logEvent({ sessionId, eventType, ms = null, meta = {} }) {
+async function logEvent({ sessionId, conversationId, eventType, ms = null, meta = {} }) {
   try {
-    if (!SESSION_SALT) console.warn("SESSION_SALT missing -> using fallback-salt (set SESSION_SALT in Railway env).");
-    if (!ADMIN_KEY) console.warn("ADMIN_KEY missing -> admin endpoints locked (set ADMIN_KEY in Railway env).");
-
     await initDb();
     const pool = getPool();
     if (!pool) return;
 
+    const sh = sessionHash(sessionId);
+    const ch = conversationHash(conversationId, sessionId);
+
     await pool.query(
-      `INSERT INTO mg_events (session_hash, event_type, prompt_version, ms, meta)
-       VALUES ($1,$2,$3,$4,$5::jsonb)`,
+      `INSERT INTO mg_events (session_hash, conversation_hash, event_type, prompt_version, ms, meta)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
       [
-        sessionHash(sessionId),
-        String(eventType),
+        sh,
+        ch,
+        String(eventType || "unknown").slice(0, 80),
         PROMPT_VERSION,
         ms === null ? null : Number(ms),
         JSON.stringify(meta || {}),
       ]
     );
   } catch (e) {
-    // ne bloque jamais le chat à cause des stats
+    // Jamais bloquant
     console.error("logEvent failed:", e?.message || String(e));
   }
 }
 
-// Feedback limiter (séparé)
-const feedbackLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => req.method === "OPTIONS",
-  message: { ok: false, error: "Trop de feedback. Réessaie dans 1 minute." },
-});
-app.use("/feedback", feedbackLimiter);
+// Vote idempotent (1 fois / conversation)
+async function logVote({ sessionId, conversationId, eventType }) {
+  await initDb();
+  const pool = getPool();
+  if (!pool) return { stored: false, alreadyVoted: false, reason: "no_db" };
 
-// --- Util: extraire du texte depuis Responses API ---
+  const sh = sessionHash(sessionId);
+  const ch = conversationHash(conversationId, sessionId);
+  const type = String(eventType || "").slice(0, 80);
+
+  // Si l'index unique partiel existe, ON CONFLICT marche.
+  // Sinon -> erreur 42P10 -> fallback check+insert.
+  const q = `
+    INSERT INTO mg_events (session_hash, conversation_hash, event_type, prompt_version, meta)
+    VALUES ($1,$2,$3,$4,$5::jsonb)
+    ON CONFLICT (conversation_hash) WHERE event_type IN ('conv_validated','conv_invalidated')
+    DO NOTHING
+    RETURNING id;
+  `;
+
+  try {
+    const r = await pool.query(q, [sh, ch, type, PROMPT_VERSION, JSON.stringify({})]);
+    if (r.rowCount === 0) return { stored: false, alreadyVoted: true };
+    return { stored: true, alreadyVoted: false };
+  } catch (e) {
+    if (String(e.code) === "42P10") {
+      const ex = await pool.query(
+        `SELECT 1 FROM mg_events
+         WHERE conversation_hash=$1 AND event_type IN ('conv_validated','conv_invalidated')
+         LIMIT 1`,
+        [ch]
+      );
+      if (ex.rowCount > 0) return { stored: false, alreadyVoted: true };
+
+      await pool.query(
+        `INSERT INTO mg_events (session_hash, conversation_hash, event_type, prompt_version, meta)
+         VALUES ($1,$2,$3,$4,$5::jsonb)`,
+        [sh, ch, type, PROMPT_VERSION, JSON.stringify({})]
+      );
+      return { stored: true, alreadyVoted: false };
+    }
+    throw e;
+  }
+}
+
+// Init DB silencieux
+initDb()
+  .then(() => console.log("DB init done ✅"))
+  .catch((e) => console.log("DB disabled or init error ⚠️", e?.message || e));
+
+/* ==========================
+   Util: extraire texte Responses API
+   ========================== */
 function extractOutputText(data) {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
@@ -320,7 +308,7 @@ Si l’utilisateur dit qu’il a choisi : tu clos chaleureusement, complice, san
    DIVERSITÉ: AXES IMPOSÉS
    ========================== */
 
-// Banque structurée (160 entrées)
+// Banque structurée (ta liste actuelle)
 const IDEA_BANK = [
   { cat: "experience", tags: ["creatif","deco"], urgentOk: true, min: 25, max: 120, text: "Un atelier céramique/poterie (initiation 1 séance)" },
   { cat: "experience", tags: ["food"], urgentOk: true, min: 30, max: 180, text: "Un atelier cuisine (thème selon ses goûts)" },
@@ -436,7 +424,7 @@ const IDEA_BANK = [
   { cat: "utile", tags: ["sport"], urgentOk: true, min: 15, max: 90, text: "Une gourde sport souple/rigide adaptée à sa pratique" },
   { cat: "utile", tags: ["zen","deco"], urgentOk: true, min: 20, max: 160, text: "Une lumière d’ambiance design pour vibe zen (lampe/veilleuse)" },
   { cat: "utile", tags: ["zen","deco"], urgentOk: true, min: 15, max: 90, text: "Un plaid ultra doux (qualité) pour ‘coin cosy’ (pas déco kitsch)" },
-  { cat: "utile", tags: ["zen","deco"], urgentOk: true, min: 15, max: 120, text: "Un rangement discret pour entrée (vide-poches design, mais sobre)" },
+  { cat: "utile", tags: ["deco","zen"], urgentOk: true, min: 20, max: 160, text: "Un rangement discret pour entrée (vide-poches design, mais sobre)" },
   { cat: "utile", tags: ["deco","zen"], urgentOk: true, min: 20, max: 160, text: "Un cadre photo premium + impression (look galerie)" },
   { cat: "utile", tags: ["voyage"], urgentOk: true, min: 15, max: 80, text: "Un parapluie compact solide (anti-retournement) – utile toute l’année" },
 
@@ -529,24 +517,24 @@ function pickTwoAxes(contextText, sessionId, seedInt) {
 
   let candidates = IDEA_BANK.slice();
 
-  if (urgent) candidates = candidates.filter(x => x.urgentOk);
-  if (budgetMax != null) candidates = candidates.filter(x => x.min <= budgetMax);
+  if (urgent) candidates = candidates.filter((x) => x.urgentOk);
+  if (budgetMax != null) candidates = candidates.filter((x) => x.min <= budgetMax);
 
   if (tags.length) {
-    const tagged = candidates.filter(x => x.tags.some(t => tags.includes(t)));
+    const tagged = candidates.filter((x) => x.tags.some((t) => tags.includes(t)));
     if (tagged.length >= 8) candidates = tagged;
   }
 
   // évite de resservir les mêmes axes dans la session
-  const filtered = candidates.filter(x => !recentSet.has(x.text));
+  const filtered = candidates.filter((x) => !recentSet.has(x.text));
   if (filtered.length >= 8) candidates = filtered;
 
   // impose 2 catégories différentes
-  const groupA = candidates.filter(x => x.cat === "experience" || x.cat === "emotion");
-  const groupB = candidates.filter(x => x.cat !== "experience" && x.cat !== "emotion");
+  const groupA = candidates.filter((x) => x.cat === "experience" || x.cat === "emotion");
+  const groupB = candidates.filter((x) => x.cat !== "experience" && x.cat !== "emotion");
 
-  const A = groupA.length ? groupA : IDEA_BANK.filter(x => x.cat === "experience" || x.cat === "emotion");
-  const B = groupB.length ? groupB : IDEA_BANK.filter(x => x.cat !== "experience" && x.cat !== "emotion");
+  const A = groupA.length ? groupA : IDEA_BANK.filter((x) => x.cat === "experience" || x.cat === "emotion");
+  const B = groupB.length ? groupB : IDEA_BANK.filter((x) => x.cat !== "experience" && x.cat !== "emotion");
 
   const axis1 = A[Math.floor(rand() * A.length)];
   let axis2 = B[Math.floor(rand() * B.length)];
@@ -619,23 +607,44 @@ app.get("/admin/db-ping", requireAdmin, async (req, res) => {
   }
 });
 
-// Public: feedback (valid/invalid) => pour tes courbes
+/**
+ * Vote conversion (pour tes courbes)
+ * body: { sessionId, conversationId, type }
+ * type: conv_validated | conv_invalidated
+ */
+app.post("/event", async (req, res) => {
+  try {
+    const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
+    const conversationId = String(req.body?.conversationId || "").slice(0, 120);
+    const type = String(req.body?.type || "").trim();
+
+    const allowed = new Set(["conv_validated", "conv_invalidated"]);
+    if (!allowed.has(type)) return res.status(400).json({ ok: false, error: "Invalid event type" });
+
+    const r = await logVote({ sessionId, conversationId, eventType: type });
+    return res.json({ ok: true, ...r });
+  } catch (e) {
+    console.error("[/event] ERROR", e?.message || e);
+    return res.status(500).json({ ok: false, error: "Backend error" });
+  }
+});
+
+// Alias compatible (si ton front envoie encore verdict valid/invalid)
 app.post("/feedback", async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
+    const conversationId = String(req.body?.conversationId || "").slice(0, 120);
     const verdict = String(req.body?.verdict || "").toLowerCase().trim();
 
     if (!["valid", "invalid"].includes(verdict)) {
       return res.status(400).json({ ok: false, error: "verdict must be 'valid' or 'invalid'" });
     }
 
-    void logEvent({
-      sessionId,
-      eventType: verdict === "valid" ? "feedback_valid" : "feedback_invalid",
-    });
-
-    return res.json({ ok: true });
+    const type = verdict === "valid" ? "conv_validated" : "conv_invalidated";
+    const r = await logVote({ sessionId, conversationId, eventType: type });
+    return res.json({ ok: true, ...r });
   } catch (e) {
+    console.error("[/feedback] ERROR", e?.message || e);
     return res.status(500).json({ ok: false, error: "Backend error" });
   }
 });
@@ -643,6 +652,7 @@ app.post("/feedback", async (req, res) => {
 app.post("/chat", async (req, res) => {
   const t0 = Date.now();
   const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
+  const conversationId = String(req.body?.conversationId || "").slice(0, 120);
 
   try {
     const userMessage = String(req.body?.message || "").trim();
@@ -661,7 +671,7 @@ app.post("/chat", async (req, res) => {
     }
 
     // log request (non bloquant)
-    void logEvent({ sessionId, eventType: "chat_request", meta: { len: userMessage.length } });
+    void logEvent({ sessionId, conversationId, eventType: "chat_request", meta: { len: userMessage.length } });
 
     let rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
     rawHistory = rawHistory
@@ -681,7 +691,7 @@ app.post("/chat", async (req, res) => {
     }
 
     // Contexte pour l’extraction (budget/délai/tags) = history + message
-    const contextText = [...rawHistory.map(m => m.content), userMessage].join(" ");
+    const contextText = [...rawHistory.map((m) => m.content), userMessage].join(" ");
 
     const inputItems = [
       ...rawHistory.map((m) => ({ type: "message", role: m.role, content: m.content.trim() })),
@@ -706,14 +716,14 @@ app.post("/chat", async (req, res) => {
     if (!r.ok) {
       const msErr = Date.now() - t0;
       console.error("OpenAI error:", r.status, JSON.stringify(data));
-      void logEvent({ sessionId, eventType: "chat_upstream_error", ms: msErr, meta: { status: r.status } });
+      void logEvent({ sessionId, conversationId, eventType: "chat_upstream_error", ms: msErr, meta: { status: r.status } });
       return res.status(502).json({ ok: false, error: "Upstream error", promptVersion: PROMPT_VERSION });
     }
 
     const answer = extractOutputText(data);
     if (!answer) {
       const msErr = Date.now() - t0;
-      void logEvent({ sessionId, eventType: "chat_empty_answer", ms: msErr });
+      void logEvent({ sessionId, conversationId, eventType: "chat_empty_answer", ms: msErr });
       return res.status(502).json({
         ok: false,
         error: "Empty answer from OpenAI",
@@ -725,6 +735,7 @@ app.post("/chat", async (req, res) => {
     const clean = String(answer).replace(/\\n/g, "\n").replace(/\u00a0/g, " ").trim();
 
     const ms = Date.now() - t0;
+
     console.log(
       JSON.stringify({
         at: new Date().toISOString(),
@@ -736,13 +747,13 @@ app.post("/chat", async (req, res) => {
     );
 
     // log response (non bloquant)
-    void logEvent({ sessionId, eventType: "chat_response", ms });
+    void logEvent({ sessionId, conversationId, eventType: "chat_response", ms });
 
     return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION, sessionId });
   } catch (err) {
     const msErr = Date.now() - t0;
     console.error("[/chat] ERROR", err);
-    void logEvent({ sessionId, eventType: "chat_backend_error", ms: msErr });
+    void logEvent({ sessionId, conversationId, eventType: "chat_backend_error", ms: msErr });
 
     return res.status(500).json({
       ok: false,

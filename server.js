@@ -1,7 +1,7 @@
 
 "use strict";
 
-const PROMPT_VERSION = "v4.10-2026-01-08";
+const PROMPT_VERSION = "v4.11-2026-01-09";
 
 const express = require("express");
 const cors = require("cors");
@@ -51,7 +51,12 @@ console.log("PORT env:", process.env.PORT);
    DB / METRICS (PostgreSQL)
    ========================== */
 
-const DATABASE_URL = process.env.DATABASE_URL || process.env.DATABASE_PRIVATE_URL || process.env.POSTGRES_URL || "";
+const DATABASE_URL =
+  process.env.DATABASE_URL ||
+  process.env.DATABASE_PRIVATE_URL ||
+  process.env.POSTGRES_URL ||
+  "";
+
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const SESSION_SALT = process.env.SESSION_SALT || "fallback-salt";
 
@@ -64,22 +69,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function hmac24(raw) {
-  return crypto.createHmac("sha256", SESSION_SALT).update(String(raw || "")).digest("hex").slice(0, 24);
-}
-
-function sessionHash(sessionId) {
-  const sid = String(sessionId || "no-session").slice(0, 200);
-  return hmac24(sid);
-}
-
-// 1 conversation = 1 recherche (revote possible quand conversationId change)
-function conversationHash(conversationId, sessionId) {
-  // fallback: si front pas à jour, on retombe sur sessionId (=> comportement "1 vote / session")
-  const raw = String(conversationId || sessionId || "no-conv").slice(0, 200);
-  return hmac24(raw);
-}
-
 function getPool() {
   if (!DATABASE_URL) return null;
   if (pgPool) return pgPool;
@@ -89,7 +78,30 @@ function getPool() {
     connectionString: DATABASE_URL,
     ssl: isInternal ? false : { rejectUnauthorized: false },
   });
+
   return pgPool;
+}
+
+// hash 24 chars stable
+function h24(label, value) {
+  return crypto
+    .createHmac("sha256", SESSION_SALT)
+    .update(`${label}:${String(value || "")}`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+// 3 niveaux : session / conversation / search
+function computeHashes({ sessionId, conversationId, searchId }) {
+  const sid = String(sessionId || "no-session").slice(0, 200);
+  const cid = String(conversationId || sid).slice(0, 200);     // stable pour le fil
+  const qid = String(searchId || "search-0").slice(0, 200);    // change à chaque "nouvelle recherche"
+
+  return {
+    session_hash: h24("s", sid),
+    conversation_hash: h24("c", cid),
+    search_hash: h24("q", `${cid}:${qid}`),
+  };
 }
 
 async function initDb() {
@@ -99,13 +111,13 @@ async function initDb() {
     const pool = getPool();
     if (!pool) throw new Error("DB disabled (DATABASE_URL missing)");
 
-    // Table compatible (ancienne + nouvelle)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS mg_events (
         id BIGSERIAL PRIMARY KEY,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         session_hash TEXT NOT NULL,
         conversation_hash TEXT,
+        search_hash TEXT,
         event_type TEXT NOT NULL,
         prompt_version TEXT,
         ms INT,
@@ -113,103 +125,65 @@ async function initDb() {
       );
     `);
 
-    // Ajout colonnes si table existait déjà sans
+    // si table existait déjà
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS conversation_hash TEXT;`);
+    await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS search_hash TEXT;`);
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS prompt_version TEXT;`);
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS ms INT;`);
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;`);
 
-    // Index
+    // Index perf
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_created_at_idx ON mg_events (created_at DESC);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_event_type_idx ON mg_events (event_type);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_session_hash_idx ON mg_events (session_hash);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_conversation_hash_idx ON mg_events (conversation_hash);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_search_hash_idx ON mg_events (search_hash);`);
 
-    // Unicité 1 vote par conversation (peut échouer si vieux doublons -> on ne casse pas le serveur)
-    try {
-      await pool.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS mg_one_vote_per_conversation
-        ON mg_events (conversation_hash)
-        WHERE event_type IN ('conv_validated','conv_invalidated');
-      `);
-      console.log("DB ready ✅ (index vote unique ok)");
-    } catch (e) {
-      console.warn("DB ready ✅ (index vote unique NON créé - doublons existants ?)", e?.message || e);
-    }
+    // IMPORTANT: 1 vote par SEARCH (pas par conversation)
+    // (si l’index existe déjà en DB, ça ne bouge pas)
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS mg_one_vote_per_search
+      ON mg_events (search_hash)
+      WHERE search_hash IS NOT NULL
+        AND event_type IN ('conv_validated','conv_invalidated');
+    `);
+
+    console.log("DB ready ✅ (unique vote per search)");
   })();
 
   return dbInitPromise;
 }
 
-async function logEvent({ sessionId, conversationId, eventType, ms = null, meta = {} }) {
+// Log générique
+async function logEvent({ sessionId, conversationId, searchId, eventType, ms = null, meta = {} }) {
   try {
     await initDb();
     const pool = getPool();
-    if (!pool) return;
+    if (!pool) return { stored: false, reason: "no_db" };
 
-    const sh = sessionHash(sessionId);
-    const ch = conversationHash(conversationId, sessionId);
+    const H = computeHashes({ sessionId, conversationId, searchId });
+    const isVote = eventType === "conv_validated" || eventType === "conv_invalidated";
 
-    await pool.query(
-      `INSERT INTO mg_events (session_hash, conversation_hash, event_type, prompt_version, ms, meta)
-       VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
-      [
-        sh,
-        ch,
-        String(eventType || "unknown").slice(0, 80),
-        PROMPT_VERSION,
-        ms === null ? null : Number(ms),
-        JSON.stringify(meta || {}),
-      ]
-    );
+    const sql = `
+      INSERT INTO mg_events (session_hash, conversation_hash, search_hash, event_type, prompt_version, ms, meta)
+      VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+      ${isVote ? "ON CONFLICT DO NOTHING" : ""}
+    `;
+
+    const r = await pool.query(sql, [
+      H.session_hash,
+      H.conversation_hash,
+      H.search_hash,
+      String(eventType || "unknown").slice(0, 80),
+      PROMPT_VERSION,
+      ms === null ? null : Number(ms),
+      JSON.stringify(meta || {}),
+    ]);
+
+    return { stored: r.rowCount === 1 };
   } catch (e) {
-    // Jamais bloquant
     console.error("logEvent failed:", e?.message || String(e));
-  }
-}
-
-// Vote idempotent (1 fois / conversation)
-async function logVote({ sessionId, conversationId, eventType }) {
-  await initDb();
-  const pool = getPool();
-  if (!pool) return { stored: false, alreadyVoted: false, reason: "no_db" };
-
-  const sh = sessionHash(sessionId);
-  const ch = conversationHash(conversationId, sessionId);
-  const type = String(eventType || "").slice(0, 80);
-
-  // Si l'index unique partiel existe, ON CONFLICT marche.
-  // Sinon -> erreur 42P10 -> fallback check+insert.
-  const q = `
-    INSERT INTO mg_events (session_hash, conversation_hash, event_type, prompt_version, meta)
-    VALUES ($1,$2,$3,$4,$5::jsonb)
-    ON CONFLICT (conversation_hash) WHERE event_type IN ('conv_validated','conv_invalidated')
-    DO NOTHING
-    RETURNING id;
-  `;
-
-  try {
-    const r = await pool.query(q, [sh, ch, type, PROMPT_VERSION, JSON.stringify({})]);
-    if (r.rowCount === 0) return { stored: false, alreadyVoted: true };
-    return { stored: true, alreadyVoted: false };
-  } catch (e) {
-    if (String(e.code) === "42P10") {
-      const ex = await pool.query(
-        `SELECT 1 FROM mg_events
-         WHERE conversation_hash=$1 AND event_type IN ('conv_validated','conv_invalidated')
-         LIMIT 1`,
-        [ch]
-      );
-      if (ex.rowCount > 0) return { stored: false, alreadyVoted: true };
-
-      await pool.query(
-        `INSERT INTO mg_events (session_hash, conversation_hash, event_type, prompt_version, meta)
-         VALUES ($1,$2,$3,$4,$5::jsonb)`,
-        [sh, ch, type, PROMPT_VERSION, JSON.stringify({})]
-      );
-      return { stored: true, alreadyVoted: false };
-    }
-    throw e;
+    return { stored: false, reason: "error" };
   }
 }
 
@@ -217,6 +191,7 @@ async function logVote({ sessionId, conversationId, eventType }) {
 initDb()
   .then(() => console.log("DB init done ✅"))
   .catch((e) => console.log("DB disabled or init error ⚠️", e?.message || e));
+
 
 /* ==========================
    Util: extraire texte Responses API
@@ -608,41 +583,51 @@ app.get("/admin/db-ping", requireAdmin, async (req, res) => {
 });
 
 /**
- * Vote conversion (pour tes courbes)
- * body: { sessionId, conversationId, type }
+ * Vote conversion
+ * body: { sessionId, conversationId, searchId, type }
  * type: conv_validated | conv_invalidated
  */
 app.post("/event", async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
     const conversationId = String(req.body?.conversationId || "").slice(0, 120);
+    const searchId = String(req.body?.searchId || "").slice(0, 120);
     const type = String(req.body?.type || "").trim();
+
+    if (!conversationId || !searchId) {
+      return res.status(400).json({ ok: false, error: "Missing conversationId/searchId" });
+    }
 
     const allowed = new Set(["conv_validated", "conv_invalidated"]);
     if (!allowed.has(type)) return res.status(400).json({ ok: false, error: "Invalid event type" });
 
-    const r = await logVote({ sessionId, conversationId, eventType: type });
-    return res.json({ ok: true, ...r });
+    const r = await logEvent({ sessionId, conversationId, searchId, eventType: type });
+    return res.json({ ok: true, stored: !!r?.stored });
   } catch (e) {
     console.error("[/event] ERROR", e?.message || e);
     return res.status(500).json({ ok: false, error: "Backend error" });
   }
 });
 
-// Alias compatible (si ton front envoie encore verdict valid/invalid)
+// Alias compatible : verdict valid/invalid => conv_validated/conv_invalidated
 app.post("/feedback", async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
     const conversationId = String(req.body?.conversationId || "").slice(0, 120);
+    const searchId = String(req.body?.searchId || "").slice(0, 120);
     const verdict = String(req.body?.verdict || "").toLowerCase().trim();
+
+    if (!conversationId || !searchId) {
+      return res.status(400).json({ ok: false, error: "Missing conversationId/searchId" });
+    }
 
     if (!["valid", "invalid"].includes(verdict)) {
       return res.status(400).json({ ok: false, error: "verdict must be 'valid' or 'invalid'" });
     }
 
     const type = verdict === "valid" ? "conv_validated" : "conv_invalidated";
-    const r = await logVote({ sessionId, conversationId, eventType: type });
-    return res.json({ ok: true, ...r });
+    const r = await logEvent({ sessionId, conversationId, searchId, eventType: type });
+    return res.json({ ok: true, stored: !!r?.stored });
   } catch (e) {
     console.error("[/feedback] ERROR", e?.message || e);
     return res.status(500).json({ ok: false, error: "Backend error" });
@@ -653,6 +638,7 @@ app.post("/chat", async (req, res) => {
   const t0 = Date.now();
   const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
   const conversationId = String(req.body?.conversationId || "").slice(0, 120);
+  const searchId = String(req.body?.searchId || "search-0").slice(0, 120);
 
   try {
     const userMessage = String(req.body?.message || "").trim();
@@ -671,7 +657,7 @@ app.post("/chat", async (req, res) => {
     }
 
     // log request (non bloquant)
-    void logEvent({ sessionId, conversationId, eventType: "chat_request", meta: { len: userMessage.length } });
+    void logEvent({ sessionId, conversationId,searchId, eventType: "chat_request", meta: { len: userMessage.length } });
 
     let rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
     rawHistory = rawHistory
@@ -747,9 +733,9 @@ app.post("/chat", async (req, res) => {
     );
 
     // log response (non bloquant)
-    void logEvent({ sessionId, conversationId, eventType: "chat_response", ms });
+    void logEvent({ sessionId, conversationId,searchId, eventType: "chat_response", ms });
 
-    return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION, sessionId });
+    return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION, sessionId, conversationId, searchId });
   } catch (err) {
     const msErr = Date.now() - t0;
     console.error("[/chat] ERROR", err);

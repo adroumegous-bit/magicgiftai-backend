@@ -1,7 +1,7 @@
 
 "use strict";
 
-const PROMPT_VERSION = "v5.1-2026-01-30";
+const PROMPT_VERSION = "v5.2-2026-01-30";
 
 const express = require("express");
 const cors = require("cors");
@@ -11,6 +11,73 @@ const { Pool } = require("pg");
 require("dotenv").config();
 
 const app = express();
+
+// ====== LEMON LICENSE GATE (48h / abonnements) ======
+const ALLOWED_PRODUCT_IDS = (process.env.ALLOWED_PRODUCT_IDS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean); // ex: "795614,123456"
+
+const BYPASS_LICENSE = process.env.BYPASS_LICENSE === "1";
+
+// Appel Lemon: POST /v1/licenses/validate
+async function lemonValidateLicense(licenseKey, instanceId = null) {
+  const body = new URLSearchParams();
+  body.set("license_key", licenseKey);
+  if (instanceId) body.set("instance_id", instanceId);
+
+  const r = await fetch("https://api.lemonsqueezy.com/v1/licenses/validate", {
+    method: "POST",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body,
+  });
+
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, data };
+}
+
+// Middleware : bloque /chat si licence invalide/expirée
+async function requireValidLicense(req, res, next) {
+  try {
+    if (BYPASS_LICENSE) return next();
+
+    const licenseKey =
+      (req.get("x-license-key") || "").trim() ||
+      String(req.body?.licenseKey || "").trim() ||
+      String(req.query?.licenseKey || "").trim();
+
+    if (!licenseKey) {
+      return res.status(401).json({ ok: false, error: "Missing license key" });
+    }
+
+    const { ok, data } = await lemonValidateLicense(licenseKey);
+
+    // spec: { valid: boolean, error, license_key: {status, expires_at...}, meta: { product_id... } }
+    if (!ok || !data || data.valid !== true) {
+      return res.status(403).json({ ok: false, error: "Invalid license key" });
+    }
+
+    const status = String(data?.license_key?.status || "").toLowerCase();
+    if (status === "expired" || status === "disabled") {
+      return res.status(403).json({ ok: false, error: `License ${status}` });
+    }
+
+    const productId = String(data?.meta?.product_id || "");
+    if (ALLOWED_PRODUCT_IDS.length && !ALLOWED_PRODUCT_IDS.includes(productId)) {
+      return res.status(403).json({ ok: false, error: "License not allowed for this product" });
+    }
+
+    // optionnel: expose au handler
+    req.lemonLicense = data;
+    next();
+  } catch (e) {
+    console.error("requireValidLicense error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "License check failed" });
+  }
+}
 
 // CORS + preflight
 app.use(cors({ origin: true }));
@@ -1181,7 +1248,7 @@ app.post("/feedback", async (req, res) => {
   }
 });
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", requireValidLicense, async (req, res) => {
   const t0 = Date.now();
   const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
   const conversationId = String(req.body?.conversationId || "").slice(0, 120);

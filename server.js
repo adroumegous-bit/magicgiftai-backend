@@ -1,7 +1,7 @@
 
 "use strict";
 
-const PROMPT_VERSION = "v5.2-2026-01-30";
+const PROMPT_VERSION = "v5.3-2026-01-30";
 
 const express = require("express");
 const cors = require("cors");
@@ -11,6 +11,172 @@ const { Pool } = require("pg");
 require("dotenv").config();
 
 const app = express();
+
+async function upsertAccessFromLicenseKey(payload) {
+  const pool = getPool();
+  if (!pool) return;
+
+  const a = payload?.data?.attributes || {};
+  const productId = String(a.product_id || "");
+  const licenseKey = String(a.key || "").trim();
+  const email = String(a.user_email || "").toLowerCase().trim();
+
+  if (!licenseKey) return;
+
+  // expires_at est parfois null → on force 48h si c’est le produit 48h
+  let expiresAt = a.expires_at ? String(a.expires_at) : null;
+  if (!expiresAt && MG_PRODUCT_48H_ID && productId === MG_PRODUCT_48H_ID) {
+    expiresAt = addHours(a.created_at, 48);
+  }
+
+  const meta = {
+    product_id: a.product_id,
+    order_id: a.order_id,
+    customer_id: a.customer_id,
+    created_at: a.created_at,
+    lemon_status: a.status,
+  };
+
+  await pool.query(
+    `
+    INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta)
+    VALUES ($1,$2,$3,NULL,$4,NULL,'active',$5,$6,$7::jsonb)
+    ON CONFLICT (license_key)
+    DO UPDATE SET
+      email = EXCLUDED.email,
+      customer_id = EXCLUDED.customer_id,
+      order_id = EXCLUDED.order_id,
+      status = EXCLUDED.status,
+      starts_at = EXCLUDED.starts_at,
+      expires_at = EXCLUDED.expires_at,
+      meta = mg_access.meta || EXCLUDED.meta,
+      updated_at = now()
+    `,
+    [
+      email || null,
+      a.customer_id ? String(a.customer_id) : null,
+      a.order_id ? String(a.order_id) : null,
+      licenseKey,
+      a.created_at ? String(a.created_at) : new Date().toISOString(),
+      expiresAt,
+      JSON.stringify(meta),
+    ]
+  );
+}
+
+async function updateAccessFromSubscription(payload) {
+  const pool = getPool();
+  if (!pool) return;
+
+  const subId = String(payload?.data?.id || "");
+  const a = payload?.data?.attributes || {};
+  const orderId = a.order_id ? String(a.order_id) : null;
+
+  // statuts Lemon -> notre status
+  const lemonStatus = String(a.status || "").toLowerCase();
+  const cancelled = Boolean(a.cancelled);
+
+  let status = "active";
+  let expiresAt = null;
+
+  // si cancel → on coupe à la fin de période (renews_at/ends_at si dispo)
+  if (cancelled) {
+    status = "cancelled";
+    expiresAt = a.ends_at ? String(a.ends_at) : (a.renews_at ? String(a.renews_at) : null);
+  }
+
+  // si expired/unpaid/etc → coupé tout de suite
+  if (["expired", "unpaid", "paused"].includes(lemonStatus)) {
+    status = lemonStatus;
+    expiresAt = a.ends_at ? String(a.ends_at) : new Date().toISOString();
+  }
+
+  const meta = {
+    subscription_id: subId,
+    lemon_status: lemonStatus,
+    cancelled,
+    renews_at: a.renews_at || null,
+    ends_at: a.ends_at || null,
+  };
+
+  // on rattache via order_id (tu l’as dans tes payloads)
+  await pool.query(
+    `
+    UPDATE mg_access
+    SET subscription_id = $1,
+        status = $2,
+        expires_at = COALESCE($3, expires_at),
+        meta = mg_access.meta || $4::jsonb,
+        updated_at = now()
+    WHERE ($5 IS NOT NULL AND order_id = $5)
+       OR (subscription_id IS NOT NULL AND subscription_id = $1)
+    `,
+    [subId, status, expiresAt, JSON.stringify(meta), orderId]
+  );
+}
+
+async function checkAccessKey(licenseKey) {
+  await initDb();
+  const pool = getPool();
+  if (!pool) return { ok: false, reason: "no_db" };
+
+  const k = String(licenseKey || "").trim();
+  if (!k) return { ok: false, reason: "missing_key" };
+
+  const r = await pool.query(
+    `
+    SELECT status, expires_at
+    FROM mg_access
+    WHERE license_key = $1
+    LIMIT 1
+    `,
+    [k]
+  );
+
+  if (!r.rowCount) return { ok: false, reason: "unknown_key" };
+
+  const row = r.rows[0];
+  const exp = row.expires_at ? new Date(row.expires_at).getTime() : null;
+  const now = Date.now();
+
+  if (row.status !== "active" && row.status !== "cancelled") {
+    return { ok: false, reason: "not_active" };
+  }
+
+  // cancelled = ok tant que pas expiré (fin de période)
+  if (exp && now > exp) return { ok: false, reason: "expired" };
+
+  return { ok: true };
+}
+
+
+const LEMON_SIGNING_SECRET = process.env.LEMON_SIGNING_SECRET || "";
+
+// mapping par product_id (OK dans ton cas: 1 produit = 1 plan)
+const MG_PRODUCT_48H_ID = String(process.env.MG_PRODUCT_48H_ID || "");
+const MG_PRODUCT_MONTHLY_ID = String(process.env.MG_PRODUCT_MONTHLY_ID || "");
+const MG_PRODUCT_ANNUAL_ID = String(process.env.MG_PRODUCT_ANNUAL_ID || "");
+
+// header attendu côté front
+const ACCESS_HEADER = "x-mg-key";
+
+function verifyLemonSignature(req) {
+  // Lemon: HMAC SHA256 hex digest envoyé dans X-Signature
+  // https://docs.lemonsqueezy.com/help/webhooks/signing-requests :contentReference[oaicite:0]{index=0}
+  if (!LEMON_SIGNING_SECRET) return false;
+
+  const signature = Buffer.from(req.get("X-Signature") || "", "utf8");
+  const hmac = crypto.createHmac("sha256", LEMON_SIGNING_SECRET);
+  const digest = Buffer.from(hmac.update(req.rawBody || Buffer.from("")).digest("hex"), "utf8");
+
+  if (signature.length !== digest.length) return false;
+  return crypto.timingSafeEqual(digest, signature);
+}
+
+function addHours(dateStr, hours) {
+  const d = new Date(dateStr);
+  return new Date(d.getTime() + hours * 3600 * 1000).toISOString();
+}
 
 // ====== LEMON LICENSE GATE (48h / abonnements) ======
 const ALLOWED_PRODUCT_IDS = (process.env.ALLOWED_PRODUCT_IDS || "")
@@ -917,6 +1083,47 @@ Consigne: même si la demande est identique, tu varies en respectant ces axes. N
    LEMON WEBHOOK (signature + log DB)
    ========================== */
 
+   app.post("/webhooks/lemon", async (req, res) => {
+  try {
+    if (!verifyLemonSignature(req)) return res.status(401).send("Invalid signature");
+
+    const payload = req.body;
+    const eventName = payload?.meta?.event_name || "unknown";
+    const eventId = String(payload?.data?.id || "");
+
+    // log brut (optionnel mais utile)
+    try {
+      await initDb();
+      const pool = getPool();
+      if (pool) {
+        await pool.query(
+          `
+          INSERT INTO mg_webhook_events (event_id, event_name, payload, status)
+          VALUES ($1,$2,$3::jsonb,'received')
+          ON CONFLICT DO NOTHING
+          `,
+          [eventId, eventName, JSON.stringify(payload)]
+        );
+      }
+    } catch (e) {
+      console.log("webhook log insert skipped:", e?.message || e);
+    }
+
+    // traitement accès
+    if (eventName === "license_key_created") {
+      await upsertAccessFromLicenseKey(payload);
+    }
+    if (eventName.startsWith("subscription_")) {
+      await updateAccessFromSubscription(payload);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[/webhooks/lemon] ERROR", e?.message || e);
+    return res.status(500).json({ ok: false });
+  }
+});
+
 function verifyLemonSignature(req) {
   const secret = LEMON_WEBHOOK_SECRET;
   const sig = req.get("x-signature") || ""; // Lemon envoie "X-Signature"
@@ -1247,6 +1454,17 @@ app.post("/feedback", async (req, res) => {
     return res.status(500).json({ ok: false, error: "Backend error" });
   }
 });
+
+async function requireAccess(req, res, next) {
+  try {
+    const key = req.get(ACCESS_HEADER) || req.query.key || "";
+    const ok = await checkAccessKey(key);
+    if (!ok.ok) return res.status(403).json({ ok: false, error: "Access denied", reason: ok.reason });
+    next();
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Access check failed" });
+  }
+}
 
 app.post("/chat", requireValidLicense, async (req, res) => {
   const t0 = Date.now();

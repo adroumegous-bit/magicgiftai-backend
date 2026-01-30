@@ -1,7 +1,7 @@
 
 "use strict";
 
-const PROMPT_VERSION = "v5-2026-01-30";
+const PROMPT_VERSION = "v5.1-2026-01-30";
 
 const express = require("express");
 const cors = require("cors");
@@ -20,7 +20,7 @@ app.use(
   express.json({
     limit: "1mb",
     verify: (req, res, buf) => {
-      req.rawBody = buf; // 👈 garde le body brut pour la signature
+    if (buf && buf.length) req.rawBody = buf; // 👈 garde le body brut pour la signature
     },
   })
 );
@@ -68,8 +68,295 @@ const DATABASE_URL =
 
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const SESSION_SALT = process.env.SESSION_SALT || "fallback-salt";
-const LEMON_WEBHOOK_SECRET = process.env.LEMON_WEBHOOK_SECRET || "";
+/* ==========================
+   LEMON / ACCESS CONTROL
+   ========================== */
 
+const LEMON_WEBHOOK_SECRET = process.env.LEMON_WEBHOOK_SECRET || "";
+const ACCESS_REQUIRED = String(process.env.ACCESS_REQUIRED || "true").toLowerCase() !== "false";
+const MG_48H_HOURS = Number(process.env.MG_48H_HOURS || "48");
+
+// clés produit/variant/sku attendues (liste séparée par virgules)
+const MG_PLAN_48H_KEYS = String(process.env.MG_PLAN_48H_KEYS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const MG_PLAN_MONTHLY_KEYS = String(process.env.MG_PLAN_MONTHLY_KEYS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const MG_PLAN_ANNUAL_KEYS = String(process.env.MG_PLAN_ANNUAL_KEYS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function pickFirst(...vals) {
+  for (const v of vals) {
+    if (v === null || v === undefined) continue;
+    const s = String(v).trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function getDeep(obj, path) {
+  try {
+    return path.reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), obj);
+  } catch {
+    return undefined;
+  }
+}
+
+function extractLemonBasics(req, payload) {
+  const eventName = pickFirst(
+    req.get("X-Event-Name"),
+    req.get("x-event-name"),
+    getDeep(payload, ["meta", "event_name"]),
+    getDeep(payload, ["meta", "eventName"]),
+    payload?.event_name
+  );
+
+  const eventId = pickFirst(
+    req.get("X-Event-Id"),
+    req.get("x-event-id"),
+    getDeep(payload, ["meta", "event_id"]),
+    getDeep(payload, ["meta", "eventId"]),
+    getDeep(payload, ["data", "id"]),
+    payload?.id
+  ) || crypto.randomUUID();
+
+  return { eventName: eventName || "unknown", eventId };
+}
+
+// essaye de récupérer une “clé produit” utilisable pour mapper tes plans
+function extractProductKey(payload) {
+  // patterns fréquents Lemon (selon le type d’événement)
+  const direct = pickFirst(
+    getDeep(payload, ["data", "attributes", "variant_id"]),
+    getDeep(payload, ["data", "attributes", "product_id"]),
+    getDeep(payload, ["data", "attributes", "product_sku"]),
+    getDeep(payload, ["data", "attributes", "variant_sku"])
+  );
+  if (direct) return direct;
+
+  // order_items (si présent)
+  const item0 = getDeep(payload, ["data", "attributes", "first_order_item"]);
+  const items = getDeep(payload, ["data", "attributes", "order_items"]);
+  const tryItem = item0 || (Array.isArray(items) ? items[0] : null) || null;
+
+  return pickFirst(
+    tryItem?.variant_id,
+    tryItem?.product_id,
+    tryItem?.product_sku,
+    tryItem?.variant_sku
+  );
+}
+
+function detectPlan(productKey) {
+  const key = String(productKey || "").trim();
+  if (!key) return { plan: "unknown", durationHours: null };
+
+  if (MG_PLAN_48H_KEYS.includes(key)) return { plan: "48h", durationHours: MG_48H_HOURS };
+  if (MG_PLAN_MONTHLY_KEYS.includes(key)) return { plan: "monthly", durationHours: null };
+  if (MG_PLAN_ANNUAL_KEYS.includes(key)) return { plan: "annual", durationHours: null };
+
+  return { plan: "unknown", durationHours: null };
+}
+
+function computeHmacHex(buf, secret) {
+  return crypto.createHmac("sha256", secret).update(buf).digest("hex");
+}
+
+function safeEqual(a, b) {
+  const A = Buffer.from(String(a || ""), "utf8");
+  const B = Buffer.from(String(b || ""), "utf8");
+  if (A.length !== B.length) return false;
+  return crypto.timingSafeEqual(A, B);
+}
+
+function verifyLemonSignature(req) {
+  if (!LEMON_WEBHOOK_SECRET) return { ok: false, reason: "LEMON_WEBHOOK_SECRET missing" };
+
+  let sig = pickFirst(req.get("X-Signature"), req.get("x-signature"), req.get("Signature"), req.get("signature"));
+  sig = String(sig || "").trim().replace(/^sha256=/i, "");
+
+  if (!sig) return { ok: false, reason: "signature header missing" };
+
+  const raw = req.rawBody && Buffer.isBuffer(req.rawBody)
+    ? req.rawBody
+    : Buffer.from(JSON.stringify(req.body || {}), "utf8");
+
+  const hex = computeHmacHex(raw, LEMON_WEBHOOK_SECRET);
+
+  // certains systèmes envoient hex, d’autres base64. On accepte les 2.
+  const b64 = Buffer.from(hex, "hex").toString("base64");
+
+  const ok = safeEqual(sig, hex) || safeEqual(sig, b64);
+  return ok ? { ok: true } : { ok: false, reason: "invalid signature" };
+}
+
+async function ensureAccessTables() {
+  const pool = getPool();
+  if (!pool) return;
+
+  // extensions utiles
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS citext;`);
+
+  // events webhook (log)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mg_webhook_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      event_id TEXT NOT NULL,
+      event_name TEXT NOT NULL,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      processed_at TIMESTAMPTZ,
+      status TEXT,
+      error TEXT
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS mg_webhook_events_event_id_ux
+    ON mg_webhook_events (event_id);
+  `);
+
+  // table accès
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mg_access (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email CITEXT,
+      customer_id TEXT,
+      order_id TEXT,
+      subscription_id TEXT,
+      license_key TEXT,
+      product_sku TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      starts_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS mg_access_license_key_ux
+    ON mg_access (license_key)
+    WHERE license_key IS NOT NULL AND license_key <> '';
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_email_idx ON mg_access (email);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_status_idx ON mg_access (status);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_expires_at_idx ON mg_access (expires_at);`);
+}
+
+function asDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+async function upsertAccess(pool, row) {
+  const metaJson = JSON.stringify(row.meta || {});
+
+  if (row.license_key) {
+    await pool.query(
+      `
+      INSERT INTO mg_access
+        (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now())
+      ON CONFLICT (license_key)
+      DO UPDATE SET
+        email = COALESCE(EXCLUDED.email, mg_access.email),
+        customer_id = COALESCE(EXCLUDED.customer_id, mg_access.customer_id),
+        order_id = COALESCE(EXCLUDED.order_id, mg_access.order_id),
+        subscription_id = COALESCE(EXCLUDED.subscription_id, mg_access.subscription_id),
+        product_sku = COALESCE(EXCLUDED.product_sku, mg_access.product_sku),
+        status = COALESCE(EXCLUDED.status, mg_access.status),
+        starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
+        expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
+        meta = mg_access.meta || EXCLUDED.meta,
+        updated_at = now()
+      `,
+      [
+        row.email || null,
+        row.customer_id || null,
+        row.order_id || null,
+        row.subscription_id || null,
+        row.license_key,
+        row.product_sku || null,
+        row.status || null,
+        row.starts_at || null,
+        row.expires_at || null,
+        metaJson,
+      ]
+    );
+    return;
+  }
+
+  // fallback si pas de licence : on insère juste (moins robuste)
+  await pool.query(
+    `
+    INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now())
+    `,
+    [
+      row.email || null,
+      row.customer_id || null,
+      row.order_id || null,
+      row.subscription_id || null,
+      null,
+      row.product_sku || null,
+      row.status || "pending",
+      row.starts_at || null,
+      row.expires_at || null,
+      metaJson,
+    ]
+  );
+}
+
+async function findActiveAccess({ licenseKey, email }) {
+  const pool = getPool();
+  if (!pool) return { active: false, reason: "db_disabled" };
+
+  const lk = String(licenseKey || "").trim();
+  const em = String(email || "").trim();
+
+  let row = null;
+
+  if (lk) {
+    const r = await pool.query(
+      `SELECT * FROM mg_access WHERE license_key = $1 ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+      [lk]
+    );
+    row = r.rows[0] || null;
+  } else if (em) {
+    const r = await pool.query(
+      `SELECT * FROM mg_access WHERE email = $1 ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+      [em]
+    );
+    row = r.rows[0] || null;
+  }
+
+  if (!row) return { active: false, reason: "not_found" };
+
+  const now = new Date();
+  const exp = row.expires_at ? new Date(row.expires_at) : null;
+
+  // si expires_at est défini et passé => non
+  if (exp && exp <= now) return { active: false, reason: "expired", row };
+
+  // statuts bloquants
+  const st = String(row.status || "").toLowerCase();
+  if (["revoked", "refunded", "expired"].includes(st)) return { active: false, reason: "status_blocked", row };
+
+  return { active: true, row };
+}
 
 let pgPool = null;
 let dbInitPromise = null;
@@ -158,6 +445,8 @@ async function initDb() {
       WHERE search_hash IS NOT NULL
         AND event_type IN ('conv_validated','conv_invalidated');
     `);
+    // ✅ tables accès + webhooks Lemon
+    await ensureAccessTables();
 
     console.log("DB ready ✅ (unique vote per search)");
   })();
@@ -640,6 +929,180 @@ app.get("/health", (req, res) => {
     dbEnabled: Boolean(DATABASE_URL),
   });
 });
+// Lemon webhook
+app.post("/webhooks/lemon", async (req, res) => {
+  try {
+    const payload = req.body || {};
+
+    // 1) signature check
+    const v = verifyLemonSignature(req);
+    if (!v.ok) {
+      console.warn("[LEMON] invalid signature:", v.reason);
+      return res.status(401).json({ ok: false });
+    }
+
+    // 2) basics
+    const { eventName, eventId } = extractLemonBasics(req, payload);
+
+    // 3) store raw event (idempotent)
+    await initDb();
+    const pool = getPool();
+    if (!pool) return res.status(500).json({ ok: false });
+
+    const ins = await pool.query(
+      `
+      INSERT INTO mg_webhook_events (event_id, event_name, payload, status)
+      VALUES ($1,$2,$3::jsonb,'received')
+      ON CONFLICT (event_id) DO NOTHING
+      RETURNING id
+      `,
+      [eventId, eventName, JSON.stringify(payload)]
+    );
+
+    if (ins.rowCount === 0) {
+      // duplicate => on répond 200 (Lemon retente sinon)
+      return res.json({ ok: true, duplicate: true });
+    }
+
+    // 4) extract useful fields
+    const attrs = getDeep(payload, ["data", "attributes"]) || {};
+    const productKey = extractProductKey(payload);
+    const { plan, durationHours } = detectPlan(productKey);
+
+    const email = pickFirst(
+      attrs.user_email,
+      attrs.customer_email,
+      attrs.email,
+      getDeep(payload, ["meta", "customer_email"])
+    );
+
+    const customerId = pickFirst(
+      attrs.customer_id,
+      getDeep(payload, ["data", "relationships", "customer", "data", "id"])
+    );
+
+    const orderId = pickFirst(
+      attrs.order_id,
+      (payload?.data?.type === "orders" ? payload?.data?.id : ""),
+      getDeep(payload, ["data", "relationships", "order", "data", "id"])
+    );
+
+    const subscriptionId = pickFirst(
+      attrs.subscription_id,
+      (payload?.data?.type === "subscriptions" ? payload?.data?.id : ""),
+      getDeep(payload, ["data", "relationships", "subscription", "data", "id"])
+    );
+
+    const licenseKey = pickFirst(
+      attrs.license_key,
+      attrs.key,
+      attrs.license_key_key,
+      getDeep(payload, ["data", "attributes", "key"])
+    );
+
+    // 5) decide status + expiry
+    const now = new Date();
+    let status = "pending";
+    let startsAt = asDate(attrs.created_at) || now;
+    let expiresAt = null;
+
+    const ev = String(eventName || "").toLowerCase();
+
+    if (ev === "order_created" || ev === "order_paid" || ev === "license_key_created") {
+      status = "active";
+      if (plan === "48h" && durationHours) {
+        expiresAt = new Date(now.getTime() + durationHours * 3600 * 1000);
+      }
+    }
+
+    if (ev === "subscription_created" || ev === "subscription_payment_success" || ev === "subscription_resumed") {
+      status = "active";
+    }
+
+    if (ev === "subscription_cancelled") {
+      // idéalement: actif jusqu'à la fin de période (si Lemon donne une date)
+      status = "cancelled";
+      expiresAt = asDate(attrs.ends_at) || asDate(attrs.renews_at) || null;
+    }
+
+    if (ev === "subscription_expired") {
+      status = "expired";
+      expiresAt = now;
+    }
+
+    if (ev === "subscription_paused") {
+      status = "paused";
+    }
+
+    if (ev === "order_refunded" || ev === "order_refund" || ev === "order_refinanced") {
+      status = "revoked";
+      expiresAt = now;
+    }
+
+    // 6) upsert mg_access
+    await upsertAccess(pool, {
+      email,
+      customer_id: customerId,
+      order_id: orderId,
+      subscription_id: subscriptionId,
+      license_key: licenseKey,
+      product_sku: productKey,
+      status,
+      starts_at: startsAt,
+      expires_at: expiresAt,
+      meta: {
+        plan,
+        eventName,
+        productKey,
+      },
+    });
+
+    // 7) mark processed
+    await pool.query(
+      `UPDATE mg_webhook_events SET processed_at = now(), status='processed' WHERE event_id=$1`,
+      [eventId]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[/webhooks/lemon] ERROR:", e?.message || e);
+    try {
+      const payload = req.body || {};
+      const { eventId } = extractLemonBasics(req, payload);
+      const pool = getPool();
+      if (pool) {
+        await pool.query(
+          `UPDATE mg_webhook_events SET processed_at=now(), status='error', error=$2 WHERE event_id=$1`,
+          [eventId, String(e?.message || e)]
+        );
+      }
+    } catch {}
+    return res.status(200).json({ ok: true }); // 200 pour éviter les retries infinis
+  }
+});
+
+// Check access (utile pour ton front)
+app.post("/access/check", async (req, res) => {
+  try {
+    const licenseKey = String(req.body?.licenseKey || req.get("x-license-key") || "").trim();
+    const email = String(req.body?.email || req.get("x-buyer-email") || "").trim();
+
+    if (!licenseKey && !email) {
+      return res.status(400).json({ ok: false, error: "Missing licenseKey/email" });
+    }
+
+    const r = await findActiveAccess({ licenseKey, email });
+    return res.json({
+      ok: true,
+      active: !!r.active,
+      reason: r.active ? null : r.reason,
+      expiresAt: r?.row?.expires_at || null,
+      plan: r?.row?.meta?.plan || null,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Backend error" });
+  }
+});
 
 app.get("/", (req, res) => {
   res.json({
@@ -726,6 +1189,22 @@ app.post("/chat", async (req, res) => {
 
   try {
     const userMessage = String(req.body?.message || "").trim();
+        // ✅ BLOQUAGE ACCÈS (payant)
+    if (ACCESS_REQUIRED) {
+      const licenseKey = String(req.body?.licenseKey || req.get("x-license-key") || "").trim();
+      const email = String(req.body?.email || req.get("x-buyer-email") || "").trim();
+
+      const access = await findActiveAccess({ licenseKey, email });
+      if (!access.active) {
+        return res.status(403).json({
+          ok: false,
+          error: "Accès non actif. Entre ta licence (ou ton email d’achat).",
+          code: "ACCESS_DENIED",
+          promptVersion: PROMPT_VERSION,
+        });
+      }
+    }
+
     if (!userMessage) {
       return res.status(400).json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
     }

@@ -1,7 +1,7 @@
 
 "use strict";
 
-const PROMPT_VERSION = "v4.11-2026-01-09";
+const PROMPT_VERSION = "v5-2026-01-30";
 
 const express = require("express");
 const cors = require("cors");
@@ -15,7 +15,16 @@ const app = express();
 // CORS + preflight
 app.use(cors({ origin: true }));
 app.options("*", cors({ origin: true }));
-app.use(express.json({ limit: "1mb" }));
+// JSON + RAW BODY (obligatoire pour vérifier la signature Lemon)
+app.use(
+  express.json({
+    limit: "1mb",
+    verify: (req, res, buf) => {
+      req.rawBody = buf; // 👈 garde le body brut pour la signature
+    },
+  })
+);
+
 
 // Rate limit (Railway)
 app.set("trust proxy", 1);
@@ -59,6 +68,8 @@ const DATABASE_URL =
 
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const SESSION_SALT = process.env.SESSION_SALT || "fallback-salt";
+const LEMON_WEBHOOK_SECRET = process.env.LEMON_WEBHOOK_SECRET || "";
+
 
 let pgPool = null;
 let dbInitPromise = null;
@@ -545,6 +556,79 @@ Consigne: même si la demande est identique, tu varies en respectant ces axes. N
 /* ==========================
    ROUTES
    ========================== */
+
+   /* ==========================
+   LEMON WEBHOOK (signature + log DB)
+   ========================== */
+
+function verifyLemonSignature(req) {
+  const secret = LEMON_WEBHOOK_SECRET;
+  const sig = req.get("x-signature") || ""; // Lemon envoie "X-Signature"
+  if (!secret || !sig || !req.rawBody) return false;
+
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(req.rawBody)
+    .digest("hex");
+
+  try {
+    return (
+      digest.length === sig.length &&
+      crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(sig, "utf8"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+app.post("/webhooks/lemon", async (req, res) => {
+  const receivedAt = new Date();
+
+  try {
+    // 1) vérif signature
+    if (!verifyLemonSignature(req)) {
+      return res.status(401).send("Bad signature");
+    }
+
+    // 2) payload
+    const event = req.body || {};
+
+    // IDs (varie selon event)
+    const eventId =
+      event?.meta?.event_id ||
+      event?.meta?.id ||
+      event?.data?.id ||
+      event?.id ||
+      null;
+
+    const eventName =
+      event?.meta?.event_name ||
+      event?.meta?.name ||
+      event?.event_name ||
+      event?.name ||
+      event?.type ||
+      null;
+
+    // 3) log DB (table déjà créée chez toi)
+    await initDb(); // garde ta logique DB
+    const pool = getPool();
+    if (!pool) return res.status(500).send("DB disabled");
+
+    await pool.query(
+      `
+      INSERT INTO mg_webhook_events (event_id, event_name, received_at, payload, status)
+      VALUES ($1, $2, $3, $4::jsonb, 'received')
+      ON CONFLICT (event_id) DO NOTHING
+      `,
+      [eventId, eventName, receivedAt.toISOString(), JSON.stringify(event)]
+    );
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("LEMON WEBHOOK ERROR:", e?.message || e);
+    return res.sendStatus(500);
+  }
+});
 
 app.get("/health", (req, res) => {
   res.json({

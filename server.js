@@ -1,7 +1,6 @@
-
 "use strict";
 
-const PROMPT_VERSION = "v5.3-2026-01-30";
+const PROMPT_VERSION = "v5.4-2026-02-02";
 
 const express = require("express");
 const cors = require("cors");
@@ -12,256 +11,55 @@ require("dotenv").config();
 
 const app = express();
 
-async function upsertAccessFromLicenseKey(payload) {
-  const pool = getPool();
-  if (!pool) return;
+/* ==========================
+   ENV
+   ========================== */
 
-  const a = payload?.data?.attributes || {};
-  const productId = String(a.product_id || "");
-  const licenseKey = String(a.key || "").trim();
-  const email = String(a.user_email || "").toLowerCase().trim();
+const DATABASE_URL =
+  process.env.DATABASE_URL ||
+  process.env.DATABASE_PRIVATE_URL ||
+  process.env.POSTGRES_URL ||
+  "";
 
-  if (!licenseKey) return;
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const SESSION_SALT = process.env.SESSION_SALT || "fallback-salt";
 
-  // expires_at est parfois null → on force 48h si c’est le produit 48h
-  let expiresAt = a.expires_at ? String(a.expires_at) : null;
-  if (!expiresAt && MG_PRODUCT_48H_ID && productId === MG_PRODUCT_48H_ID) {
-    expiresAt = addHours(a.created_at, 48);
-  }
+const ACCESS_REQUIRED = String(process.env.ACCESS_REQUIRED || "true").toLowerCase() !== "false";
+const ACCESS_HEADER = "x-mg-key";
 
-  const meta = {
-    product_id: a.product_id,
-    order_id: a.order_id,
-    customer_id: a.customer_id,
-    created_at: a.created_at,
-    lemon_status: a.status,
-  };
+// Lemon webhook secret (accept 2 noms au cas où tu utilises l’autre)
+const LEMON_WEBHOOK_SECRET =
+  process.env.LEMON_WEBHOOK_SECRET ||
+  process.env.LEMON_SIGNING_SECRET ||
+  "";
 
-  await pool.query(
-    `
-    INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta)
-    VALUES ($1,$2,$3,NULL,$4,NULL,'active',$5,$6,$7::jsonb)
-    ON CONFLICT (license_key)
-    DO UPDATE SET
-      email = EXCLUDED.email,
-      customer_id = EXCLUDED.customer_id,
-      order_id = EXCLUDED.order_id,
-      status = EXCLUDED.status,
-      starts_at = EXCLUDED.starts_at,
-      expires_at = EXCLUDED.expires_at,
-      meta = mg_access.meta || EXCLUDED.meta,
-      updated_at = now()
-    `,
-    [
-      email || null,
-      a.customer_id ? String(a.customer_id) : null,
-      a.order_id ? String(a.order_id) : null,
-      licenseKey,
-      a.created_at ? String(a.created_at) : new Date().toISOString(),
-      expiresAt,
-      JSON.stringify(meta),
-    ]
-  );
-}
-
-async function updateAccessFromSubscription(payload) {
-  const pool = getPool();
-  if (!pool) return;
-
-  const subId = String(payload?.data?.id || "");
-  const a = payload?.data?.attributes || {};
-  const orderId = a.order_id ? String(a.order_id) : null;
-
-  // statuts Lemon -> notre status
-  const lemonStatus = String(a.status || "").toLowerCase();
-  const cancelled = Boolean(a.cancelled);
-
-  let status = "active";
-  let expiresAt = null;
-
-  // si cancel → on coupe à la fin de période (renews_at/ends_at si dispo)
-  if (cancelled) {
-    status = "cancelled";
-    expiresAt = a.ends_at ? String(a.ends_at) : (a.renews_at ? String(a.renews_at) : null);
-  }
-
-  // si expired/unpaid/etc → coupé tout de suite
-  if (["expired", "unpaid", "paused"].includes(lemonStatus)) {
-    status = lemonStatus;
-    expiresAt = a.ends_at ? String(a.ends_at) : new Date().toISOString();
-  }
-
-  const meta = {
-    subscription_id: subId,
-    lemon_status: lemonStatus,
-    cancelled,
-    renews_at: a.renews_at || null,
-    ends_at: a.ends_at || null,
-  };
-
-  // on rattache via order_id (tu l’as dans tes payloads)
-  await pool.query(
-    `
-    UPDATE mg_access
-    SET subscription_id = $1,
-        status = $2,
-        expires_at = COALESCE($3, expires_at),
-        meta = mg_access.meta || $4::jsonb,
-        updated_at = now()
-    WHERE ($5 IS NOT NULL AND order_id = $5)
-       OR (subscription_id IS NOT NULL AND subscription_id = $1)
-    `,
-    [subId, status, expiresAt, JSON.stringify(meta), orderId]
-  );
-}
-
-async function checkAccessKey(licenseKey) {
-  await initDb();
-  const pool = getPool();
-  if (!pool) return { ok: false, reason: "no_db" };
-
-  const k = String(licenseKey || "").trim();
-  if (!k) return { ok: false, reason: "missing_key" };
-
-  const r = await pool.query(
-    `
-    SELECT status, expires_at
-    FROM mg_access
-    WHERE license_key = $1
-    LIMIT 1
-    `,
-    [k]
-  );
-
-  if (!r.rowCount) return { ok: false, reason: "unknown_key" };
-
-  const row = r.rows[0];
-  const exp = row.expires_at ? new Date(row.expires_at).getTime() : null;
-  const now = Date.now();
-
-  if (row.status !== "active" && row.status !== "cancelled") {
-    return { ok: false, reason: "not_active" };
-  }
-
-  // cancelled = ok tant que pas expiré (fin de période)
-  if (exp && now > exp) return { ok: false, reason: "expired" };
-
-  return { ok: true };
-}
-
-
-const LEMON_SIGNING_SECRET = process.env.LEMON_SIGNING_SECRET || "";
-
-// mapping par product_id (OK dans ton cas: 1 produit = 1 plan)
+// Plans (mapping par product_id comme tu veux)
 const MG_PRODUCT_48H_ID = String(process.env.MG_PRODUCT_48H_ID || "");
 const MG_PRODUCT_MONTHLY_ID = String(process.env.MG_PRODUCT_MONTHLY_ID || "");
 const MG_PRODUCT_ANNUAL_ID = String(process.env.MG_PRODUCT_ANNUAL_ID || "");
+const MG_48H_HOURS = Number(process.env.MG_48H_HOURS || "48");
 
-// header attendu côté front
-const ACCESS_HEADER = "x-mg-key";
+/* ==========================
+   MIDDLEWARES (CORS / RAW BODY)
+   ========================== */
 
-function verifyLemonSignature(req) {
-  // Lemon: HMAC SHA256 hex digest envoyé dans X-Signature
-  // https://docs.lemonsqueezy.com/help/webhooks/signing-requests :contentReference[oaicite:0]{index=0}
-  if (!LEMON_SIGNING_SECRET) return false;
-
-  const signature = Buffer.from(req.get("X-Signature") || "", "utf8");
-  const hmac = crypto.createHmac("sha256", LEMON_SIGNING_SECRET);
-  const digest = Buffer.from(hmac.update(req.rawBody || Buffer.from("")).digest("hex"), "utf8");
-
-  if (signature.length !== digest.length) return false;
-  return crypto.timingSafeEqual(digest, signature);
-}
-
-function addHours(dateStr, hours) {
-  const d = new Date(dateStr);
-  return new Date(d.getTime() + hours * 3600 * 1000).toISOString();
-}
-
-// ====== LEMON LICENSE GATE (48h / abonnements) ======
-const ALLOWED_PRODUCT_IDS = (process.env.ALLOWED_PRODUCT_IDS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean); // ex: "795614,123456"
-
-const BYPASS_LICENSE = process.env.BYPASS_LICENSE === "1";
-
-// Appel Lemon: POST /v1/licenses/validate
-async function lemonValidateLicense(licenseKey, instanceId = null) {
-  const body = new URLSearchParams();
-  body.set("license_key", licenseKey);
-  if (instanceId) body.set("instance_id", instanceId);
-
-  const r = await fetch("https://api.lemonsqueezy.com/v1/licenses/validate", {
-    method: "POST",
-    headers: {
-      "Accept": "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body,
-  });
-
-  const data = await r.json().catch(() => ({}));
-  return { ok: r.ok, data };
-}
-
-// Middleware : bloque /chat si licence invalide/expirée
-async function requireValidLicense(req, res, next) {
-  try {
-    if (BYPASS_LICENSE) return next();
-
-    const licenseKey =
-      (req.get("x-license-key") || "").trim() ||
-      String(req.body?.licenseKey || "").trim() ||
-      String(req.query?.licenseKey || "").trim();
-
-    if (!licenseKey) {
-      return res.status(401).json({ ok: false, error: "Missing license key" });
-    }
-
-    const { ok, data } = await lemonValidateLicense(licenseKey);
-
-    // spec: { valid: boolean, error, license_key: {status, expires_at...}, meta: { product_id... } }
-    if (!ok || !data || data.valid !== true) {
-      return res.status(403).json({ ok: false, error: "Invalid license key" });
-    }
-
-    const status = String(data?.license_key?.status || "").toLowerCase();
-    if (status === "expired" || status === "disabled") {
-      return res.status(403).json({ ok: false, error: `License ${status}` });
-    }
-
-    const productId = String(data?.meta?.product_id || "");
-    if (ALLOWED_PRODUCT_IDS.length && !ALLOWED_PRODUCT_IDS.includes(productId)) {
-      return res.status(403).json({ ok: false, error: "License not allowed for this product" });
-    }
-
-    // optionnel: expose au handler
-    req.lemonLicense = data;
-    next();
-  } catch (e) {
-    console.error("requireValidLicense error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: "License check failed" });
-  }
-}
-
-// CORS + preflight
 app.use(cors({ origin: true }));
 app.options("*", cors({ origin: true }));
+
 // JSON + RAW BODY (obligatoire pour vérifier la signature Lemon)
 app.use(
   express.json({
     limit: "1mb",
     verify: (req, res, buf) => {
-    if (buf && buf.length) req.rawBody = buf; // 👈 garde le body brut pour la signature
+      req.rawBody = buf; // Buffer
     },
   })
 );
 
-
-// Rate limit (Railway)
+// Railway proxy
 app.set("trust proxy", 1);
 
+// Rate limit /chat
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 20,
@@ -272,7 +70,7 @@ const chatLimiter = rateLimit({
 });
 app.use("/chat", chatLimiter);
 
-// limiter événements (vote/feedback)
+// limiter événements
 const eventLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
@@ -284,180 +82,73 @@ const eventLimiter = rateLimit({
 app.use("/event", eventLimiter);
 app.use("/feedback", eventLimiter);
 
-// Logs safe
+/* ==========================
+   LOGS SAFE
+   ========================== */
+
 console.log("PROMPT_VERSION:", PROMPT_VERSION);
 console.log("OPENAI key loaded:", (process.env.OPENAI_API_KEY || "").slice(0, 12) + "...");
 console.log("PORT env:", process.env.PORT);
+console.log("DB enabled:", Boolean(DATABASE_URL));
+console.log("ACCESS_REQUIRED:", ACCESS_REQUIRED);
 
 /* ==========================
-   DB / METRICS (PostgreSQL)
+   DB (PostgreSQL)
    ========================== */
 
-const DATABASE_URL =
-  process.env.DATABASE_URL ||
-  process.env.DATABASE_PRIVATE_URL ||
-  process.env.POSTGRES_URL ||
-  "";
+let pgPool = null;
+let dbInitPromise = null;
 
-const ADMIN_KEY = process.env.ADMIN_KEY || "";
-const SESSION_SALT = process.env.SESSION_SALT || "fallback-salt";
-/* ==========================
-   LEMON / ACCESS CONTROL
-   ========================== */
+function getPool() {
+  if (!DATABASE_URL) return null;
+  if (pgPool) return pgPool;
 
-const LEMON_WEBHOOK_SECRET = process.env.LEMON_WEBHOOK_SECRET || "";
-const ACCESS_REQUIRED = String(process.env.ACCESS_REQUIRED || "true").toLowerCase() !== "false";
-const MG_48H_HOURS = Number(process.env.MG_48H_HOURS || "48");
-
-// clés produit/variant/sku attendues (liste séparée par virgules)
-const MG_PLAN_48H_KEYS = String(process.env.MG_PLAN_48H_KEYS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const MG_PLAN_MONTHLY_KEYS = String(process.env.MG_PLAN_MONTHLY_KEYS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const MG_PLAN_ANNUAL_KEYS = String(process.env.MG_PLAN_ANNUAL_KEYS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-function pickFirst(...vals) {
-  for (const v of vals) {
-    if (v === null || v === undefined) continue;
-    const s = String(v).trim();
-    if (s) return s;
-  }
-  return "";
+  const isInternal = DATABASE_URL.includes("railway.internal");
+  pgPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: isInternal ? false : { rejectUnauthorized: false },
+  });
+  return pgPool;
 }
 
-function getDeep(obj, path) {
-  try {
-    return path.reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), obj);
-  } catch {
-    return undefined;
-  }
-}
-
-function extractLemonBasics(req, payload) {
-  const eventName = pickFirst(
-    req.get("X-Event-Name"),
-    req.get("x-event-name"),
-    getDeep(payload, ["meta", "event_name"]),
-    getDeep(payload, ["meta", "eventName"]),
-    payload?.event_name
-  );
-
-  const eventId = pickFirst(
-    req.get("X-Event-Id"),
-    req.get("x-event-id"),
-    getDeep(payload, ["meta", "event_id"]),
-    getDeep(payload, ["meta", "eventId"]),
-    getDeep(payload, ["data", "id"]),
-    payload?.id
-  ) || crypto.randomUUID();
-
-  return { eventName: eventName || "unknown", eventId };
-}
-
-// essaye de récupérer une “clé produit” utilisable pour mapper tes plans
-function extractProductKey(payload) {
-  // patterns fréquents Lemon (selon le type d’événement)
-  const direct = pickFirst(
-    getDeep(payload, ["data", "attributes", "variant_id"]),
-    getDeep(payload, ["data", "attributes", "product_id"]),
-    getDeep(payload, ["data", "attributes", "product_sku"]),
-    getDeep(payload, ["data", "attributes", "variant_sku"])
-  );
-  if (direct) return direct;
-
-  // order_items (si présent)
-  const item0 = getDeep(payload, ["data", "attributes", "first_order_item"]);
-  const items = getDeep(payload, ["data", "attributes", "order_items"]);
-  const tryItem = item0 || (Array.isArray(items) ? items[0] : null) || null;
-
-  return pickFirst(
-    tryItem?.variant_id,
-    tryItem?.product_id,
-    tryItem?.product_sku,
-    tryItem?.variant_sku
-  );
-}
-
-function detectPlan(productKey) {
-  const key = String(productKey || "").trim();
-  if (!key) return { plan: "unknown", durationHours: null };
-
-  if (MG_PLAN_48H_KEYS.includes(key)) return { plan: "48h", durationHours: MG_48H_HOURS };
-  if (MG_PLAN_MONTHLY_KEYS.includes(key)) return { plan: "monthly", durationHours: null };
-  if (MG_PLAN_ANNUAL_KEYS.includes(key)) return { plan: "annual", durationHours: null };
-
-  return { plan: "unknown", durationHours: null };
-}
-
-function computeHmacHex(buf, secret) {
-  return crypto.createHmac("sha256", secret).update(buf).digest("hex");
-}
-
-function safeEqual(a, b) {
-  const A = Buffer.from(String(a || ""), "utf8");
-  const B = Buffer.from(String(b || ""), "utf8");
-  if (A.length !== B.length) return false;
-  return crypto.timingSafeEqual(A, B);
-}
-
-function verifyLemonSignature(req) {
-  if (!LEMON_WEBHOOK_SECRET) return { ok: false, reason: "LEMON_WEBHOOK_SECRET missing" };
-
-  let sig = pickFirst(req.get("X-Signature"), req.get("x-signature"), req.get("Signature"), req.get("signature"));
-  sig = String(sig || "").trim().replace(/^sha256=/i, "");
-
-  if (!sig) return { ok: false, reason: "signature header missing" };
-
-  const raw = req.rawBody && Buffer.isBuffer(req.rawBody)
-    ? req.rawBody
-    : Buffer.from(JSON.stringify(req.body || {}), "utf8");
-
-  const hex = computeHmacHex(raw, LEMON_WEBHOOK_SECRET);
-
-  // certains systèmes envoient hex, d’autres base64. On accepte les 2.
-  const b64 = Buffer.from(hex, "hex").toString("base64");
-
-  const ok = safeEqual(sig, hex) || safeEqual(sig, b64);
-  return ok ? { ok: true } : { ok: false, reason: "invalid signature" };
+function requireAdmin(req, res, next) {
+  const key = req.get("x-admin-key") || req.query.key || "";
+  if (!ADMIN_KEY || key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
+  next();
 }
 
 async function ensureAccessTables() {
   const pool = getPool();
   if (!pool) return;
 
-  // extensions utiles
-  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-  await pool.query(`CREATE EXTENSION IF NOT EXISTS citext;`);
+  // Extensions (si ok)
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`).catch(() => {});
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS citext;`).catch(() => {});
 
-  // events webhook (log)
+  // ---- mg_webhook_events : on ajoute delivery_id pour éviter collisions ----
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_webhook_events (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       event_id TEXT NOT NULL,
       event_name TEXT NOT NULL,
-      received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-      processed_at TIMESTAMPTZ,
-      status TEXT,
-      error TEXT
+      received_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
 
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS mg_webhook_events_event_id_ux
-    ON mg_webhook_events (event_id);
-  `);
+  // colonnes manquantes si table ancienne
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS delivery_id TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS resource_id TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS status TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS error TEXT;`).catch(() => {});
 
-  // table accès
+  // Unique sur delivery_id (pas sur resource_id !)
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS mg_webhook_events_delivery_id_ux ON mg_webhook_events (delivery_id);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_event_name_idx ON mg_webhook_events (event_name);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_received_at_idx ON mg_webhook_events (received_at DESC);`).catch(() => {});
+
+  // ---- mg_access : on force les colonnes utiles même si table déjà existante ----
   await pool.query(`
     CREATE TABLE IF NOT EXISTS mg_access (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -474,146 +165,45 @@ async function ensureAccessTables() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       meta JSONB NOT NULL DEFAULT '{}'::jsonb
     );
-  `);
+  `).catch(async () => {
+    // si citext pas dispo, fallback TEXT (rare mais possible)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mg_access (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email TEXT,
+        customer_id TEXT,
+        order_id TEXT,
+        subscription_id TEXT,
+        license_key TEXT,
+        product_sku TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        starts_at TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        meta JSONB NOT NULL DEFAULT '{}'::jsonb
+      );
+    `);
+  });
+
+  // si table ancienne, on ajoute quand même
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;`).catch(() => {});
 
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS mg_access_license_key_ux
     ON mg_access (license_key)
-    WHERE license_key IS NOT NULL AND license_key <> '';
-  `);
+  `).catch(() => {});
 
-  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_email_idx ON mg_access (email);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_status_idx ON mg_access (status);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_expires_at_idx ON mg_access (expires_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_order_id_idx ON mg_access (order_id);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_subscription_id_idx ON mg_access (subscription_id);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_status_idx ON mg_access (status);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_access_expires_at_idx ON mg_access (expires_at);`).catch(() => {});
 }
 
-function asDate(v) {
-  if (!v) return null;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-async function upsertAccess(pool, row) {
-  const metaJson = JSON.stringify(row.meta || {});
-
-  if (row.license_key) {
-    await pool.query(
-      `
-      INSERT INTO mg_access
-        (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
-      VALUES
-        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now())
-      ON CONFLICT (license_key)
-      DO UPDATE SET
-        email = COALESCE(EXCLUDED.email, mg_access.email),
-        customer_id = COALESCE(EXCLUDED.customer_id, mg_access.customer_id),
-        order_id = COALESCE(EXCLUDED.order_id, mg_access.order_id),
-        subscription_id = COALESCE(EXCLUDED.subscription_id, mg_access.subscription_id),
-        product_sku = COALESCE(EXCLUDED.product_sku, mg_access.product_sku),
-        status = COALESCE(EXCLUDED.status, mg_access.status),
-        starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
-        expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
-        meta = mg_access.meta || EXCLUDED.meta,
-        updated_at = now()
-      `,
-      [
-        row.email || null,
-        row.customer_id || null,
-        row.order_id || null,
-        row.subscription_id || null,
-        row.license_key,
-        row.product_sku || null,
-        row.status || null,
-        row.starts_at || null,
-        row.expires_at || null,
-        metaJson,
-      ]
-    );
-    return;
-  }
-
-  // fallback si pas de licence : on insère juste (moins robuste)
-  await pool.query(
-    `
-    INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now())
-    `,
-    [
-      row.email || null,
-      row.customer_id || null,
-      row.order_id || null,
-      row.subscription_id || null,
-      null,
-      row.product_sku || null,
-      row.status || "pending",
-      row.starts_at || null,
-      row.expires_at || null,
-      metaJson,
-    ]
-  );
-}
-
-async function findActiveAccess({ licenseKey, email }) {
-  const pool = getPool();
-  if (!pool) return { active: false, reason: "db_disabled" };
-
-  const lk = String(licenseKey || "").trim();
-  const em = String(email || "").trim();
-
-  let row = null;
-
-  if (lk) {
-    const r = await pool.query(
-      `SELECT * FROM mg_access WHERE license_key = $1 ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
-      [lk]
-    );
-    row = r.rows[0] || null;
-  } else if (em) {
-    const r = await pool.query(
-      `SELECT * FROM mg_access WHERE email = $1 ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
-      [em]
-    );
-    row = r.rows[0] || null;
-  }
-
-  if (!row) return { active: false, reason: "not_found" };
-
-  const now = new Date();
-  const exp = row.expires_at ? new Date(row.expires_at) : null;
-
-  // si expires_at est défini et passé => non
-  if (exp && exp <= now) return { active: false, reason: "expired", row };
-
-  // statuts bloquants
-  const st = String(row.status || "").toLowerCase();
-  if (["revoked", "refunded", "expired"].includes(st)) return { active: false, reason: "status_blocked", row };
-
-  return { active: true, row };
-}
-
-let pgPool = null;
-let dbInitPromise = null;
-
-function requireAdmin(req, res, next) {
-  const key = req.get("x-admin-key") || req.query.key || "";
-  if (!ADMIN_KEY || key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
-  next();
-}
-
-function getPool() {
-  if (!DATABASE_URL) return null;
-  if (pgPool) return pgPool;
-
-  const isInternal = DATABASE_URL.includes("railway.internal");
-  pgPool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: isInternal ? false : { rejectUnauthorized: false },
-  });
-
-  return pgPool;
-}
-
-// hash 24 chars stable
 function h24(label, value) {
   return crypto
     .createHmac("sha256", SESSION_SALT)
@@ -622,12 +212,10 @@ function h24(label, value) {
     .slice(0, 24);
 }
 
-// 3 niveaux : session / conversation / search
 function computeHashes({ sessionId, conversationId, searchId }) {
   const sid = String(sessionId || "no-session").slice(0, 200);
-  const cid = String(conversationId || sid).slice(0, 200);     // stable pour le fil
-  const qid = String(searchId || "search-0").slice(0, 200);    // change à chaque "nouvelle recherche"
-
+  const cid = String(conversationId || sid).slice(0, 200);
+  const qid = String(searchId || "search-0").slice(0, 200);
   return {
     session_hash: h24("s", sid),
     conversation_hash: h24("c", cid),
@@ -656,38 +244,33 @@ async function initDb() {
       );
     `);
 
-    // si table existait déjà
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS conversation_hash TEXT;`);
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS search_hash TEXT;`);
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS prompt_version TEXT;`);
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS ms INT;`);
     await pool.query(`ALTER TABLE mg_events ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;`);
 
-    // Index perf
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_created_at_idx ON mg_events (created_at DESC);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_event_type_idx ON mg_events (event_type);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_session_hash_idx ON mg_events (session_hash);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_conversation_hash_idx ON mg_events (conversation_hash);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS mg_events_search_hash_idx ON mg_events (search_hash);`);
 
-    // IMPORTANT: 1 vote par SEARCH (pas par conversation)
-    // (si l’index existe déjà en DB, ça ne bouge pas)
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS mg_one_vote_per_search
       ON mg_events (search_hash)
       WHERE search_hash IS NOT NULL
         AND event_type IN ('conv_validated','conv_invalidated');
     `);
-    // ✅ tables accès + webhooks Lemon
+
     await ensureAccessTables();
 
-    console.log("DB ready ✅ (unique vote per search)");
+    console.log("DB ready ✅");
   })();
 
   return dbInitPromise;
 }
 
-// Log générique
 async function logEvent({ sessionId, conversationId, searchId, eventType, ms = null, meta = {} }) {
   try {
     await initDb();
@@ -725,6 +308,255 @@ initDb()
   .then(() => console.log("DB init done ✅"))
   .catch((e) => console.log("DB disabled or init error ⚠️", e?.message || e));
 
+/* ==========================
+   LEMON SIGNATURE + HELPERS
+   ========================== */
+
+function sha256Hex(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function safeEqual(a, b) {
+  const A = Buffer.from(String(a || ""), "utf8");
+  const B = Buffer.from(String(b || ""), "utf8");
+  if (A.length !== B.length) return false;
+  return crypto.timingSafeEqual(A, B);
+}
+
+function verifyLemonSignature(req) {
+  if (!LEMON_WEBHOOK_SECRET) return { ok: false, reason: "LEMON_WEBHOOK_SECRET missing" };
+
+  const sig = String(req.get("X-Signature") || req.get("x-signature") || "").trim().replace(/^sha256=/i, "");
+  if (!sig) return { ok: false, reason: "signature header missing" };
+
+  const raw = req.rawBody && Buffer.isBuffer(req.rawBody)
+    ? req.rawBody
+    : Buffer.from(JSON.stringify(req.body || {}), "utf8");
+
+  const expected = crypto.createHmac("sha256", LEMON_WEBHOOK_SECRET).update(raw).digest("hex");
+
+  return safeEqual(sig, expected) ? { ok: true } : { ok: false, reason: "invalid signature" };
+}
+
+function addHours(dateStr, hours) {
+  const d = new Date(dateStr);
+  return new Date(d.getTime() + hours * 3600 * 1000).toISOString();
+}
+
+function pickFirst(...vals) {
+  for (const v of vals) {
+    if (v === null || v === undefined) continue;
+    const s = String(v).trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function extractWebhookBasics(req, payload) {
+  const eventName = pickFirst(
+    req.get("X-Event-Name"),
+    req.get("x-event-name"),
+    payload?.meta?.event_name,
+    payload?.event_name
+  ) || "unknown";
+
+  // IMPORTANT: on prend un id unique PAR LIVRAISON (sinon collision sur subscription_updated)
+  const deliveryId = pickFirst(
+    req.get("X-Event-Id"),
+    req.get("x-event-id"),
+    req.get("X-Request-Id"),
+    req.get("x-request-id")
+  ) || sha256Hex(req.rawBody || Buffer.from(JSON.stringify(payload || {}), "utf8"));
+
+  const resourceId = pickFirst(payload?.data?.id, payload?.data?.attributes?.order_id, payload?.data?.attributes?.subscription_id);
+
+  return { eventName, deliveryId, resourceId: resourceId ? String(resourceId) : null };
+}
+
+/* ==========================
+   ACCESS DB (mg_access)
+   ========================== */
+
+async function upsertAccessFromLicenseKey(payload) {
+  const pool = getPool();
+  if (!pool) return;
+
+  const a = payload?.data?.attributes || {};
+  const productId = String(a.product_id || "");
+  const licenseKey = String(a.key || "").trim();
+  const email = String(a.user_email || "").toLowerCase().trim();
+
+  if (!licenseKey) return;
+
+  let expiresAt = a.expires_at ? String(a.expires_at) : null;
+
+  // 48h : Lemon ne met pas forcément expires_at, donc on calcule
+  if (!expiresAt && MG_PRODUCT_48H_ID && productId === MG_PRODUCT_48H_ID) {
+    expiresAt = addHours(a.created_at || new Date().toISOString(), MG_48H_HOURS);
+  }
+
+  const meta = {
+    product_id: a.product_id || null,
+    order_id: a.order_id || null,
+    customer_id: a.customer_id || null,
+    created_at: a.created_at || null,
+    lemon_status: a.status || null,
+    // utile debug
+    source_event: "license_key_created",
+  };
+
+  await pool.query(
+    `
+    INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
+    VALUES ($1,$2,$3,NULL,$4,$5,'active',$6,$7,$8::jsonb, now())
+    ON CONFLICT (license_key)
+    DO UPDATE SET
+      email = EXCLUDED.email,
+      customer_id = EXCLUDED.customer_id,
+      order_id = EXCLUDED.order_id,
+      status = EXCLUDED.status,
+      starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
+      expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
+      meta = mg_access.meta || EXCLUDED.meta,
+      updated_at = now()
+    `,
+    [
+      email || null,
+      a.customer_id ? String(a.customer_id) : null,
+      a.order_id ? String(a.order_id) : null,
+      licenseKey,
+      productId || null, // on stock product_id dans product_sku (pratique)
+      a.created_at ? String(a.created_at) : new Date().toISOString(),
+      expiresAt,
+      JSON.stringify(meta),
+    ]
+  );
+}
+
+async function updateAccessFromSubscription(eventName, payload) {
+  const pool = getPool();
+  if (!pool) return;
+
+  const subId = String(payload?.data?.id || "");
+  const a = payload?.data?.attributes || {};
+  const orderId = a.order_id ? String(a.order_id) : null;
+
+  const lemonStatus = String(a.status || "").toLowerCase();
+  const cancelled = Boolean(a.cancelled) || String(eventName || "").toLowerCase() === "subscription_cancelled";
+
+  // paid-through date (fin de période)
+  const endsAt = a.ends_at ? String(a.ends_at) : null;
+  const renewsAt = a.renews_at ? String(a.renews_at) : null;
+  const paidThrough = endsAt || renewsAt || null;
+
+  let status = "active";
+
+  if (["expired", "unpaid"].includes(lemonStatus) || String(eventName).toLowerCase() === "subscription_expired") {
+    status = "expired";
+  } else if (["paused"].includes(lemonStatus) || String(eventName).toLowerCase() === "subscription_paused") {
+    status = "paused";
+  } else if (cancelled || lemonStatus === "cancelled") {
+    // IMPORTANT: cancelled = OK tant que paidThrough pas dépassé
+    status = "cancelled";
+  } else {
+    status = "active";
+  }
+
+  const meta = {
+    subscription_id: subId,
+    lemon_status: lemonStatus,
+    cancelled,
+    renews_at: a.renews_at || null,
+    ends_at: a.ends_at || null,
+    product_id: a.product_id || null,
+    variant_id: a.variant_id || null,
+    source_event: eventName,
+  };
+
+  await pool.query(
+    `
+    UPDATE mg_access
+    SET
+      subscription_id = COALESCE(subscription_id, $1),
+      status = $2,
+      -- on met expires_at = paidThrough (date de fin de période) si dispo
+      expires_at = CASE
+        WHEN $3 IS NULL THEN expires_at
+        ELSE $3::timestamptz
+      END,
+      meta = mg_access.meta || $4::jsonb,
+      updated_at = now()
+    WHERE
+      ($5 IS NOT NULL AND order_id = $5)
+      OR (subscription_id IS NOT NULL AND subscription_id = $1)
+    `,
+    [subId, status, paidThrough, JSON.stringify(meta), orderId]
+  );
+}
+
+async function checkAccessKey(licenseKey) {
+  await initDb();
+  const pool = getPool();
+  if (!pool) return { ok: false, reason: "no_db" };
+
+  const k = String(licenseKey || "").trim();
+  if (!k) return { ok: false, reason: "missing_key" };
+
+  const r = await pool.query(
+    `
+    SELECT status, expires_at
+    FROM mg_access
+    WHERE license_key = $1
+    LIMIT 1
+    `,
+    [k]
+  );
+
+  if (!r.rowCount) return { ok: false, reason: "unknown_key" };
+
+  const row = r.rows[0];
+  const st = String(row.status || "").toLowerCase();
+  const exp = row.expires_at ? new Date(row.expires_at).getTime() : null;
+  const now = Date.now();
+
+  // autorisés
+  if (st !== "active" && st !== "cancelled") return { ok: false, reason: "not_active" };
+
+  // cancelled OK tant que pas expiré
+  if (exp && now > exp) return { ok: false, reason: "expired" };
+
+  return { ok: true };
+}
+
+function extractClientLicenseKey(req) {
+  return (
+    String(req.get(ACCESS_HEADER) || "").trim() ||
+    String(req.get("x-license-key") || "").trim() ||
+    String(req.body?.licenseKey || "").trim() ||
+    String(req.query?.licenseKey || "").trim() ||
+    String(req.query?.key || "").trim()
+  );
+}
+
+async function requireAccess(req, res, next) {
+  try {
+    if (!ACCESS_REQUIRED) return next();
+    const key = extractClientLicenseKey(req);
+    const ok = await checkAccessKey(key);
+    if (!ok.ok) {
+      return res.status(403).json({
+        ok: false,
+        code: "ACCESS_DENIED",
+        reason: ok.reason,
+        error: "Accès non actif. Entre ta licence.",
+        promptVersion: PROMPT_VERSION,
+      });
+    }
+    next();
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Access check failed" });
+  }
+}
 
 /* ==========================
    Util: extraire texte Responses API
@@ -740,6 +572,10 @@ function extractOutputText(data) {
       ?.filter((t) => typeof t === "string" && t.trim().length > 0) || [];
   return chunks.join("\n").trim();
 }
+
+/* ==========================
+   PROMPT + BANK
+   ========================== */
 
 // ✅ Prompt maître (SYSTEM)
 const BASE_PROMPT = `
@@ -956,7 +792,7 @@ const IDEA_BANK = [
 function mulberry32(seed) {
   let t = seed >>> 0;
   return function () {
-    t += 0x6D2B79F5;
+    t += 0x6d2b79f5;
     let r = Math.imul(t ^ (t >>> 15), 1 | t);
     r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
     return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
@@ -995,17 +831,16 @@ function extractTags(text) {
   return [...tags];
 }
 
-// anti-répétition par session (mémoire en RAM)
-const SESSION_RECENT = new Map(); // sessionId -> { lastSeen:number, recent:string[] }
+// anti-répétition par session (RAM)
+const SESSION_RECENT = new Map();
 function touchSession(sessionId) {
   const now = Date.now();
   const cur = SESSION_RECENT.get(sessionId);
   if (cur) cur.lastSeen = now;
   else SESSION_RECENT.set(sessionId, { lastSeen: now, recent: [] });
 
-  // purge simple si ça grossit trop
   if (SESSION_RECENT.size > 5000) {
-    const cutoff = now - 24 * 3600 * 1000; // 24h
+    const cutoff = now - 24 * 3600 * 1000;
     for (const [k, v] of SESSION_RECENT.entries()) {
       if (!v || !v.lastSeen || v.lastSeen < cutoff) SESSION_RECENT.delete(k);
     }
@@ -1024,20 +859,17 @@ function pickTwoAxes(contextText, sessionId, seedInt) {
   const budgetMax = extractBudgetMax(contextText);
 
   let candidates = IDEA_BANK.slice();
-
   if (urgent) candidates = candidates.filter((x) => x.urgentOk);
   if (budgetMax != null) candidates = candidates.filter((x) => x.min <= budgetMax);
 
   if (tags.length) {
     const tagged = candidates.filter((x) => x.tags.some((t) => tags.includes(t)));
-    if (tagged.length >= 8) candidates = tagged;
+    if (tagged.length >= 4) candidates = tagged;
   }
 
-  // évite de resservir les mêmes axes dans la session
   const filtered = candidates.filter((x) => !recentSet.has(x.text));
-  if (filtered.length >= 8) candidates = filtered;
+  if (filtered.length >= 4) candidates = filtered;
 
-  // impose 2 catégories différentes
   const groupA = candidates.filter((x) => x.cat === "experience" || x.cat === "emotion");
   const groupB = candidates.filter((x) => x.cat !== "experience" && x.cat !== "emotion");
 
@@ -1079,303 +911,16 @@ Consigne: même si la demande est identique, tu varies en respectant ces axes. N
    ROUTES
    ========================== */
 
-   /* ==========================
-   LEMON WEBHOOK (signature + log DB)
-   ========================== */
-
-   app.post("/webhooks/lemon", async (req, res) => {
-  try {
-    if (!verifyLemonSignature(req)) return res.status(401).send("Invalid signature");
-
-    const payload = req.body;
-    const eventName = payload?.meta?.event_name || "unknown";
-    const eventId = String(payload?.data?.id || "");
-
-    // log brut (optionnel mais utile)
-    try {
-      await initDb();
-      const pool = getPool();
-      if (pool) {
-        await pool.query(
-          `
-          INSERT INTO mg_webhook_events (event_id, event_name, payload, status)
-          VALUES ($1,$2,$3::jsonb,'received')
-          ON CONFLICT DO NOTHING
-          `,
-          [eventId, eventName, JSON.stringify(payload)]
-        );
-      }
-    } catch (e) {
-      console.log("webhook log insert skipped:", e?.message || e);
-    }
-
-    // traitement accès
-    if (eventName === "license_key_created") {
-      await upsertAccessFromLicenseKey(payload);
-    }
-    if (eventName.startsWith("subscription_")) {
-      await updateAccessFromSubscription(payload);
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[/webhooks/lemon] ERROR", e?.message || e);
-    return res.status(500).json({ ok: false });
-  }
-});
-
-function verifyLemonSignature(req) {
-  const secret = LEMON_WEBHOOK_SECRET;
-  const sig = req.get("x-signature") || ""; // Lemon envoie "X-Signature"
-  if (!secret || !sig || !req.rawBody) return false;
-
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(req.rawBody)
-    .digest("hex");
-
-  try {
-    return (
-      digest.length === sig.length &&
-      crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(sig, "utf8"))
-    );
-  } catch {
-    return false;
-  }
-}
-
-app.post("/webhooks/lemon", async (req, res) => {
-  const receivedAt = new Date();
-
-  try {
-    // 1) vérif signature
-    if (!verifyLemonSignature(req)) {
-      return res.status(401).send("Bad signature");
-    }
-
-    // 2) payload
-    const event = req.body || {};
-
-    // IDs (varie selon event)
-    const eventId =
-      event?.meta?.event_id ||
-      event?.meta?.id ||
-      event?.data?.id ||
-      event?.id ||
-      null;
-
-    const eventName =
-      event?.meta?.event_name ||
-      event?.meta?.name ||
-      event?.event_name ||
-      event?.name ||
-      event?.type ||
-      null;
-
-    // 3) log DB (table déjà créée chez toi)
-    await initDb(); // garde ta logique DB
-    const pool = getPool();
-    if (!pool) return res.status(500).send("DB disabled");
-
-    await pool.query(
-      `
-      INSERT INTO mg_webhook_events (event_id, event_name, received_at, payload, status)
-      VALUES ($1, $2, $3, $4::jsonb, 'received')
-      ON CONFLICT (event_id) DO NOTHING
-      `,
-      [eventId, eventName, receivedAt.toISOString(), JSON.stringify(event)]
-    );
-
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error("LEMON WEBHOOK ERROR:", e?.message || e);
-    return res.sendStatus(500);
-  }
-});
-
+// Health
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "MagicGiftAI backend",
     time: new Date().toISOString(),
     promptVersion: PROMPT_VERSION,
-    portEnv: process.env.PORT || null,
     dbEnabled: Boolean(DATABASE_URL),
+    accessRequired: ACCESS_REQUIRED,
   });
-});
-// Lemon webhook
-app.post("/webhooks/lemon", async (req, res) => {
-  try {
-    const payload = req.body || {};
-
-    // 1) signature check
-    const v = verifyLemonSignature(req);
-    if (!v.ok) {
-      console.warn("[LEMON] invalid signature:", v.reason);
-      return res.status(401).json({ ok: false });
-    }
-
-    // 2) basics
-    const { eventName, eventId } = extractLemonBasics(req, payload);
-
-    // 3) store raw event (idempotent)
-    await initDb();
-    const pool = getPool();
-    if (!pool) return res.status(500).json({ ok: false });
-
-    const ins = await pool.query(
-      `
-      INSERT INTO mg_webhook_events (event_id, event_name, payload, status)
-      VALUES ($1,$2,$3::jsonb,'received')
-      ON CONFLICT (event_id) DO NOTHING
-      RETURNING id
-      `,
-      [eventId, eventName, JSON.stringify(payload)]
-    );
-
-    if (ins.rowCount === 0) {
-      // duplicate => on répond 200 (Lemon retente sinon)
-      return res.json({ ok: true, duplicate: true });
-    }
-
-    // 4) extract useful fields
-    const attrs = getDeep(payload, ["data", "attributes"]) || {};
-    const productKey = extractProductKey(payload);
-    const { plan, durationHours } = detectPlan(productKey);
-
-    const email = pickFirst(
-      attrs.user_email,
-      attrs.customer_email,
-      attrs.email,
-      getDeep(payload, ["meta", "customer_email"])
-    );
-
-    const customerId = pickFirst(
-      attrs.customer_id,
-      getDeep(payload, ["data", "relationships", "customer", "data", "id"])
-    );
-
-    const orderId = pickFirst(
-      attrs.order_id,
-      (payload?.data?.type === "orders" ? payload?.data?.id : ""),
-      getDeep(payload, ["data", "relationships", "order", "data", "id"])
-    );
-
-    const subscriptionId = pickFirst(
-      attrs.subscription_id,
-      (payload?.data?.type === "subscriptions" ? payload?.data?.id : ""),
-      getDeep(payload, ["data", "relationships", "subscription", "data", "id"])
-    );
-
-    const licenseKey = pickFirst(
-      attrs.license_key,
-      attrs.key,
-      attrs.license_key_key,
-      getDeep(payload, ["data", "attributes", "key"])
-    );
-
-    // 5) decide status + expiry
-    const now = new Date();
-    let status = "pending";
-    let startsAt = asDate(attrs.created_at) || now;
-    let expiresAt = null;
-
-    const ev = String(eventName || "").toLowerCase();
-
-    if (ev === "order_created" || ev === "order_paid" || ev === "license_key_created") {
-      status = "active";
-      if (plan === "48h" && durationHours) {
-        expiresAt = new Date(now.getTime() + durationHours * 3600 * 1000);
-      }
-    }
-
-    if (ev === "subscription_created" || ev === "subscription_payment_success" || ev === "subscription_resumed") {
-      status = "active";
-    }
-
-    if (ev === "subscription_cancelled") {
-      // idéalement: actif jusqu'à la fin de période (si Lemon donne une date)
-      status = "cancelled";
-      expiresAt = asDate(attrs.ends_at) || asDate(attrs.renews_at) || null;
-    }
-
-    if (ev === "subscription_expired") {
-      status = "expired";
-      expiresAt = now;
-    }
-
-    if (ev === "subscription_paused") {
-      status = "paused";
-    }
-
-    if (ev === "order_refunded" || ev === "order_refund" || ev === "order_refinanced") {
-      status = "revoked";
-      expiresAt = now;
-    }
-
-    // 6) upsert mg_access
-    await upsertAccess(pool, {
-      email,
-      customer_id: customerId,
-      order_id: orderId,
-      subscription_id: subscriptionId,
-      license_key: licenseKey,
-      product_sku: productKey,
-      status,
-      starts_at: startsAt,
-      expires_at: expiresAt,
-      meta: {
-        plan,
-        eventName,
-        productKey,
-      },
-    });
-
-    // 7) mark processed
-    await pool.query(
-      `UPDATE mg_webhook_events SET processed_at = now(), status='processed' WHERE event_id=$1`,
-      [eventId]
-    );
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("[/webhooks/lemon] ERROR:", e?.message || e);
-    try {
-      const payload = req.body || {};
-      const { eventId } = extractLemonBasics(req, payload);
-      const pool = getPool();
-      if (pool) {
-        await pool.query(
-          `UPDATE mg_webhook_events SET processed_at=now(), status='error', error=$2 WHERE event_id=$1`,
-          [eventId, String(e?.message || e)]
-        );
-      }
-    } catch {}
-    return res.status(200).json({ ok: true }); // 200 pour éviter les retries infinis
-  }
-});
-
-// Check access (utile pour ton front)
-app.post("/access/check", async (req, res) => {
-  try {
-    const licenseKey = String(req.body?.licenseKey || req.get("x-license-key") || "").trim();
-    const email = String(req.body?.email || req.get("x-buyer-email") || "").trim();
-
-    if (!licenseKey && !email) {
-      return res.status(400).json({ ok: false, error: "Missing licenseKey/email" });
-    }
-
-    const r = await findActiveAccess({ licenseKey, email });
-    return res.json({
-      ok: true,
-      active: !!r.active,
-      reason: r.active ? null : r.reason,
-      expiresAt: r?.row?.expires_at || null,
-      plan: r?.row?.meta?.plan || null,
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "Backend error" });
-  }
 });
 
 app.get("/", (req, res) => {
@@ -1390,7 +935,7 @@ app.get("/chat/ping", (req, res) => {
   res.json({ ok: true, promptVersion: PROMPT_VERSION });
 });
 
-// Admin: test DB
+// Admin ping DB
 app.get("/admin/db-ping", requireAdmin, async (req, res) => {
   try {
     await initDb();
@@ -1403,11 +948,79 @@ app.get("/admin/db-ping", requireAdmin, async (req, res) => {
   }
 });
 
-/**
- * Vote conversion
- * body: { sessionId, conversationId, searchId, type }
- * type: conv_validated | conv_invalidated
- */
+// ✅ Webhook Lemon UNIQUE (plus de doublons)
+app.post("/webhooks/lemon", async (req, res) => {
+  const payload = req.body || {};
+  const receivedAt = new Date();
+
+  try {
+    const v = verifyLemonSignature(req);
+    if (!v.ok) {
+      console.warn("[LEMON] invalid signature:", v.reason);
+      return res.status(401).send("Bad signature");
+    }
+
+    const { eventName, deliveryId, resourceId } = extractWebhookBasics(req, payload);
+
+    await initDb();
+    const pool = getPool();
+    if (!pool) return res.status(500).send("DB disabled");
+
+    const ins = await pool.query(
+      `
+      INSERT INTO mg_webhook_events (event_id, event_name, received_at, delivery_id, resource_id, payload, status)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb,'received')
+      ON CONFLICT (delivery_id) DO NOTHING
+      RETURNING id
+      `,
+      [
+        // event_id historique: on met deliveryId pour éviter collisions
+        String(deliveryId),
+        String(eventName),
+        receivedAt.toISOString(),
+        String(deliveryId),
+        resourceId,
+        JSON.stringify(payload),
+      ]
+    );
+
+    if (ins.rowCount === 0) {
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+
+    // Process
+    if (String(eventName).toLowerCase() === "license_key_created") {
+      await upsertAccessFromLicenseKey(payload);
+    } else if (String(eventName).toLowerCase().startsWith("subscription_")) {
+      await updateAccessFromSubscription(eventName, payload);
+    } else if (String(eventName).toLowerCase() === "order_refunded") {
+      // optionnel : revoke si tu veux (à faire plus tard)
+    }
+
+    await pool.query(
+      `UPDATE mg_webhook_events SET processed_at=now(), status='processed' WHERE delivery_id=$1`,
+      [String(deliveryId)]
+    );
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error("[/webhooks/lemon] ERROR:", e?.message || e);
+    try {
+      const pool = getPool();
+      if (pool) {
+        const { deliveryId } = extractWebhookBasics(req, payload);
+        await pool.query(
+          `UPDATE mg_webhook_events SET processed_at=now(), status='error', error=$2 WHERE delivery_id=$1`,
+          [String(deliveryId), String(e?.message || e)]
+        );
+      }
+    } catch {}
+    // 200 pour éviter retry infini Lemon
+    return res.status(200).json({ ok: true });
+  }
+});
+
+// Vote conversion
 app.post("/event", async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
@@ -1430,7 +1043,7 @@ app.post("/event", async (req, res) => {
   }
 });
 
-// Alias compatible : verdict valid/invalid => conv_validated/conv_invalidated
+// Alias feedback
 app.post("/feedback", async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
@@ -1455,18 +1068,8 @@ app.post("/feedback", async (req, res) => {
   }
 });
 
-async function requireAccess(req, res, next) {
-  try {
-    const key = req.get(ACCESS_HEADER) || req.query.key || "";
-    const ok = await checkAccessKey(key);
-    if (!ok.ok) return res.status(403).json({ ok: false, error: "Access denied", reason: ok.reason });
-    next();
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "Access check failed" });
-  }
-}
-
-app.post("/chat", requireValidLicense, async (req, res) => {
+// ✅ CHAT : uniquement DB access (plus de Lemon validate qui casse après cancel)
+app.post("/chat", requireAccess, async (req, res) => {
   const t0 = Date.now();
   const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
   const conversationId = String(req.body?.conversationId || "").slice(0, 120);
@@ -1474,21 +1077,6 @@ app.post("/chat", requireValidLicense, async (req, res) => {
 
   try {
     const userMessage = String(req.body?.message || "").trim();
-        // ✅ BLOQUAGE ACCÈS (payant)
-    if (ACCESS_REQUIRED) {
-      const licenseKey = String(req.body?.licenseKey || req.get("x-license-key") || "").trim();
-      const email = String(req.body?.email || req.get("x-buyer-email") || "").trim();
-
-      const access = await findActiveAccess({ licenseKey, email });
-      if (!access.active) {
-        return res.status(403).json({
-          ok: false,
-          error: "Accès non actif. Entre ta licence (ou ton email d’achat).",
-          code: "ACCESS_DENIED",
-          promptVersion: PROMPT_VERSION,
-        });
-      }
-    }
 
     if (!userMessage) {
       return res.status(400).json({ ok: false, error: "Missing 'message' in body", promptVersion: PROMPT_VERSION });
@@ -1504,8 +1092,7 @@ app.post("/chat", requireValidLicense, async (req, res) => {
       });
     }
 
-    // log request (non bloquant)
-    void logEvent({ sessionId, conversationId,searchId, eventType: "chat_request", meta: { len: userMessage.length } });
+    void logEvent({ sessionId, conversationId, searchId, eventType: "chat_request", meta: { len: userMessage.length } });
 
     let rawHistory = Array.isArray(req.body?.history) ? req.body.history : [];
     rawHistory = rawHistory
@@ -1518,13 +1105,11 @@ app.post("/chat", requireValidLicense, async (req, res) => {
       )
       .slice(-10);
 
-    // Si le front a déjà mis le message courant dans history, on le retire
     const last = rawHistory[rawHistory.length - 1];
     if (last && last.role === "user" && last.content.trim() === userMessage) {
       rawHistory = rawHistory.slice(0, -1);
     }
 
-    // Contexte pour l’extraction (budget/délai/tags) = history + message
     const contextText = [...rawHistory.map((m) => m.content), userMessage].join(" ");
 
     const inputItems = [
@@ -1550,14 +1135,14 @@ app.post("/chat", requireValidLicense, async (req, res) => {
     if (!r.ok) {
       const msErr = Date.now() - t0;
       console.error("OpenAI error:", r.status, JSON.stringify(data));
-      void logEvent({ sessionId, conversationId, eventType: "chat_upstream_error", ms: msErr, meta: { status: r.status } });
+      void logEvent({ sessionId, conversationId, searchId, eventType: "chat_upstream_error", ms: msErr, meta: { status: r.status } });
       return res.status(502).json({ ok: false, error: "Upstream error", promptVersion: PROMPT_VERSION });
     }
 
     const answer = extractOutputText(data);
     if (!answer) {
       const msErr = Date.now() - t0;
-      void logEvent({ sessionId, conversationId, eventType: "chat_empty_answer", ms: msErr });
+      void logEvent({ sessionId, conversationId, searchId, eventType: "chat_empty_answer", ms: msErr });
       return res.status(502).json({
         ok: false,
         error: "Empty answer from OpenAI",
@@ -1567,33 +1152,18 @@ app.post("/chat", requireValidLicense, async (req, res) => {
     }
 
     const clean = String(answer).replace(/\\n/g, "\n").replace(/\u00a0/g, " ").trim();
-
     const ms = Date.now() - t0;
 
-    console.log(
-      JSON.stringify({
-        at: new Date().toISOString(),
-        route: "/chat",
-        sessionId,
-        ms,
-        promptVersion: PROMPT_VERSION,
-      })
-    );
-
-    // log response (non bloquant)
-    void logEvent({ sessionId, conversationId,searchId, eventType: "chat_response", ms });
+    console.log(JSON.stringify({ at: new Date().toISOString(), route: "/chat", sessionId, ms, promptVersion: PROMPT_VERSION }));
+    void logEvent({ sessionId, conversationId, searchId, eventType: "chat_response", ms });
 
     return res.json({ ok: true, answer: clean, promptVersion: PROMPT_VERSION, sessionId, conversationId, searchId });
   } catch (err) {
     const msErr = Date.now() - t0;
     console.error("[/chat] ERROR", err);
-    void logEvent({ sessionId, conversationId, eventType: "chat_backend_error", ms: msErr });
+    void logEvent({ sessionId, conversationId, searchId, eventType: "chat_backend_error", ms: msErr });
 
-    return res.status(500).json({
-      ok: false,
-      error: "Backend error",
-      promptVersion: PROMPT_VERSION,
-    });
+    return res.status(500).json({ ok: false, error: "Backend error", promptVersion: PROMPT_VERSION });
   }
 });
 

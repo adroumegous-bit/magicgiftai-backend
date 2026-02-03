@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.4-2026-02-02";
+const PROMPT_VERSION = "v5.5-2026-02-03";
 
 const express = require("express");
 const cors = require("cors");
@@ -951,6 +951,27 @@ app.get("/admin/db-ping", requireAdmin, async (req, res) => {
 // ✅ Webhook Lemon UNIQUE (plus de doublons)
 app.post("/webhooks/lemon", async (req, res) => {
   const payload = req.body || {};
+  const eventName = String(
+  req.get("X-Event-Name") ||
+  req.get("x-event-name") ||
+  payload?.meta?.event_name ||
+  payload?.event_name ||
+  "unknown"
+).trim();
+
+let eventId = String(
+  req.get("X-Event-Id") ||
+  req.get("x-event-id") ||
+  payload?.meta?.event_id ||
+  payload?.meta?.eventId ||
+  ""
+).trim();
+
+// fallback béton si Lemon ne fournit pas l’ID (rare)
+if (!eventId) {
+  eventId = crypto.createHash("sha256").update(req.rawBody || Buffer.from("")).digest("hex");
+}
+
   const receivedAt = new Date();
 
   try {
@@ -998,9 +1019,36 @@ app.post("/webhooks/lemon", async (req, res) => {
     }
 
     await pool.query(
-      `UPDATE mg_webhook_events SET processed_at=now(), status='processed' WHERE delivery_id=$1`,
-      [String(deliveryId)]
-    );
+  `
+  INSERT INTO mg_access (
+    email, customer_id, order_id, subscription_id,
+    license_key, product_sku, status, starts_at, expires_at, meta
+  )
+  VALUES ($1,$2,$3,NULL,$4,$5,'active',$6::timestamptz,$7::timestamptz,$8::jsonb)
+
+  ON CONFLICT (license_key) WHERE license_key IS NOT NULL AND license_key <> ''
+  DO UPDATE SET
+    email = EXCLUDED.email,
+    customer_id = EXCLUDED.customer_id,
+    order_id = EXCLUDED.order_id,
+    status = EXCLUDED.status,
+    starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
+    expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
+    meta = mg_access.meta || EXCLUDED.meta,
+    updated_at = now()
+  `,
+  [
+    email || null,
+    a.customer_id ? String(a.customer_id) : null,
+    a.order_id ? String(a.order_id) : null,
+    licenseKey,
+    productId || null,
+    (a.created_at ? String(a.created_at) : new Date().toISOString()),
+    expiresAt,
+    JSON.stringify(meta),
+  ]
+);
+
 
     return res.status(200).json({ ok: true });
   } catch (e) {

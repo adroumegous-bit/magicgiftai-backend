@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.5-2026-02-03";
+const PROMPT_VERSION = "v5.6-2026-02-03";
 
 const express = require("express");
 const cors = require("cors");
@@ -409,7 +409,7 @@ async function upsertAccessFromLicenseKey(payload) {
     `
     INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
     VALUES ($1,$2,$3,NULL,$4,$5,'active',$6,$7,$8::jsonb, now())
-    ON CONFLICT (license_key)
+    ON CONFLICT (license_key) WHERE license_key IS NOT NULL AND license_key <> ''
     DO UPDATE SET
       email = EXCLUDED.email,
       customer_id = EXCLUDED.customer_id,

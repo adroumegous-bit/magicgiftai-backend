@@ -404,34 +404,8 @@ async function upsertAccessFromLicenseKey(payload) {
     // utile debug
     source_event: "license_key_created",
   };
-
-  await pool.query(
-    `
-    INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
-    VALUES ($1,$2,$3,NULL,$4,$5,'active',$6,$7,$8::jsonb, now())
-    ON CONFLICT (license_key) WHERE license_key IS NOT NULL AND license_key <> ''
-    DO UPDATE SET
-      email = EXCLUDED.email,
-      customer_id = EXCLUDED.customer_id,
-      order_id = EXCLUDED.order_id,
-      status = EXCLUDED.status,
-      starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
-      expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
-      meta = mg_access.meta || EXCLUDED.meta,
-      updated_at = now()
-    `,
-    [
-      email || null,
-      a.customer_id ? String(a.customer_id) : null,
-      a.order_id ? String(a.order_id) : null,
-      licenseKey,
-      productId || null, // on stock product_id dans product_sku (pratique)
-      a.created_at ? String(a.created_at) : new Date().toISOString(),
-      expiresAt,
-      JSON.stringify(meta),
-    ]
-  );
 }
+
 
 async function updateAccessFromSubscription(eventName, payload) {
   const pool = getPool();

@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.7-2026-02-04";
+const PROMPT_VERSION = "v5.8-2026-02-04";
 
 const express = require("express");
 const cors = require("cors");
@@ -516,26 +516,20 @@ async function checkAccessKey(licenseKey) {
 
   const row = r.rows[0];
   const st = String(row.status || "").toLowerCase();
-  const exp = row.expires_at ? new Date(row.expires_at): null;
-  if (st === "cancelled" && !exp) {
-  return { active: false, reason: "cancelled_no_expiry", row };
-}
-if (eventName === "subscription_created"
- || eventName === "subscription_updated"
- || eventName === "subscription_payment_success"
- || eventName === "subscription_resumed") {
+  const exp = row.expires_at ? new Date(row.expires_at) : null;
+  const now = new Date();
 
-  status = "active";
-  expiresAt = a.renews_at ? String(a.renews_at) : null; // IMPORTANT
-}
-
-  // autorisés
-  if (st !== "active" && st !== "cancelled") return { ok: false, reason: "not_active" };
+  // statuts interdits
+  if (!["active", "cancelled"].includes(st)) {
+    return { ok: false, reason: "not_active", status: st };
+  }
 
   // cancelled OK tant que pas expiré
-  if (exp && now > exp) return { ok: false, reason: "expired" };
+  if (exp && now > exp) {
+    return { ok: false, reason: "expired", status: st };
+  }
 
-  return { ok: true };
+  return { ok: true, status: st, expiresAt: exp };
 }
 
 function extractClientLicenseKey(req) {
@@ -548,7 +542,7 @@ function extractClientLicenseKey(req) {
   );
 }
 
-async function requireAccess(req, res, next) {
+async function requireAccess(req, res, next) {}
   try {
     if (!ACCESS_REQUIRED) return next();
     const key = extractClientLicenseKey(req);
@@ -564,9 +558,14 @@ async function requireAccess(req, res, next) {
     }
     next();
   } catch (e) {
-    return res.status(500).json({ ok: false, error: "Access check failed" });
-  }
+  console.error("[requireAccess] ERROR:", e?.stack || e);
+  return res.status(500).json({
+    ok: false,
+    error: "Access check failed",
+    promptVersion: PROMPT_VERSION,
+  });
 }
+
 
 /* ==========================
    Util: extraire texte Responses API
@@ -1132,6 +1131,9 @@ app.post("/chat", requireAccess, async (req, res) => {
   const sessionId = String(req.body?.sessionId || "no-session").slice(0, 80);
   const conversationId = String(req.body?.conversationId || "").slice(0, 120);
   const searchId = String(req.body?.searchId || "search-0").slice(0, 120);
+
+  const k = extractClientLicenseKey(req);
+    console.log("[/chat] access OK for key", k ? (k.slice(0, 6) + "…") : "(missing)");
 
   try {
     const userMessage = String(req.body?.message || "").trim();

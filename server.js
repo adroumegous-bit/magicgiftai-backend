@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.6-2026-02-03";
+const PROMPT_VERSION = "v5.7-2026-02-04";
 
 const express = require("express");
 const cors = require("cors");
@@ -516,8 +516,18 @@ async function checkAccessKey(licenseKey) {
 
   const row = r.rows[0];
   const st = String(row.status || "").toLowerCase();
-  const exp = row.expires_at ? new Date(row.expires_at).getTime() : null;
-  const now = Date.now();
+  const exp = row.expires_at ? new Date(row.expires_at): null;
+  if (st === "cancelled" && !exp) {
+  return { active: false, reason: "cancelled_no_expiry", row };
+}
+if (eventName === "subscription_created"
+ || eventName === "subscription_updated"
+ || eventName === "subscription_payment_success"
+ || eventName === "subscription_resumed") {
+
+  status = "active";
+  expiresAt = a.renews_at ? String(a.renews_at) : null; // IMPORTANT
+}
 
   // autorisés
   if (st !== "active" && st !== "cancelled") return { ok: false, reason: "not_active" };

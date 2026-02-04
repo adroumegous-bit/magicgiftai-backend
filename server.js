@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.8-2026-02-04";
+const PROMPT_VERSION = "v5.9-2026-02-04";
 
 const express = require("express");
 const cors = require("cors");
@@ -142,6 +142,10 @@ async function ensureAccessTables() {
   await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;`).catch(() => {});
   await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS status TEXT;`).catch(() => {});
   await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS error TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS subscription_status TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT false;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS renews_at TIMESTAMPTZ;`).catch(() => {});
 
   // Unique sur delivery_id (pas sur resource_id !)
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS mg_webhook_events_delivery_id_ux ON mg_webhook_events (delivery_id);`).catch(() => {});
@@ -448,24 +452,39 @@ async function updateAccessFromSubscription(eventName, payload) {
   };
 
   await pool.query(
-    `
-    UPDATE mg_access
-    SET
-      subscription_id = COALESCE(subscription_id, $1),
-      status = $2,
-      -- on met expires_at = paidThrough (date de fin de période) si dispo
-      expires_at = CASE
-        WHEN $3 IS NULL THEN expires_at
-        ELSE $3::timestamptz
-      END,
-      meta = mg_access.meta || $4::jsonb,
-      updated_at = now()
-    WHERE
-      ($5 IS NOT NULL AND order_id = $5)
-      OR (subscription_id IS NOT NULL AND subscription_id = $1)
-    `,
-    [subId, status, paidThrough, JSON.stringify(meta), orderId]
-  );
+  `
+  UPDATE mg_access
+  SET
+    subscription_id = COALESCE(subscription_id, $1::text),
+    subscription_status = $2::text,
+    cancelled = $3::boolean,
+    ends_at = $4::timestamptz,
+    renews_at = $5::timestamptz,
+    -- expires_at = date de fin de droit (ends_at ou renews_at)
+    expires_at = COALESCE($6::timestamptz, expires_at),
+    -- status = active tant que expires_at est futur (même si cancelled)
+    status = CASE
+      WHEN COALESCE($6::timestamptz, expires_at) IS NULL THEN status
+      WHEN now() < COALESCE($6::timestamptz, expires_at) THEN 'active'
+      ELSE 'expired'
+    END,
+    meta = mg_access.meta || $7::jsonb,
+    updated_at = now()
+  WHERE
+    ($8::text IS NOT NULL AND order_id = $8::text)
+    OR (subscription_id IS NOT NULL AND subscription_id = $1::text)
+  `,
+  [
+    subId,
+    lemonStatus,        // subscription_status
+    cancelled,
+    endsAt,
+    renewsAt,
+    paidThrough,        // expires_at
+    JSON.stringify(meta),
+    orderId,
+  ]
+);
 }
 
 async function checkAccessKey(licenseKey) {
@@ -478,7 +497,7 @@ async function checkAccessKey(licenseKey) {
 
   const r = await pool.query(
     `
-    SELECT status, expires_at
+    SELECT status, expires_at,cancelled
     FROM mg_access
     WHERE license_key = $1
     LIMIT 1
@@ -491,21 +510,26 @@ async function checkAccessKey(licenseKey) {
   const row = r.rows[0];
   const st = String(row.status || "").toLowerCase();
   const exp = row.expires_at ? new Date(row.expires_at) : null;
+  const cancelled = row.cancelled === true;
+
   const now = new Date();
 
-  // statuts interdits
-  if (!["active", "cancelled"].includes(st)) {
-    return { ok: false, reason: "not_active", status: st };
+  // Si abonnement annulé, on accepte tant que expires_at est futur
+  if (cancelled) {
+    if (!exp) return { ok: false, reason: "cancelled_no_expiry" };
+    if (now > exp) return { ok: false, reason: "expired" };
+    return { ok: true };
   }
 
-  // cancelled OK tant que pas expiré
-  if (exp && now > exp) {
-    return { ok: false, reason: "expired", status: st };
-  }
+  // autorisés
+  if (st !== "active") return { ok: false, reason: "not_active" };
 
-  return { ok: true, status: st, expiresAt: exp };
+  // expiré si exp existe et passée
+  if (exp && now > exp) return { ok: false, reason: "expired" };
+
+  return { ok: true };
 }
-
+  
 function extractClientLicenseKey(req) {
   return (
     String(req.get(ACCESS_HEADER) || "").trim() ||
@@ -934,27 +958,6 @@ app.get("/admin/db-ping", requireAdmin, async (req, res) => {
 // ✅ Webhook Lemon UNIQUE (plus de doublons)
 app.post("/webhooks/lemon", async (req, res) => {
   const payload = req.body || {};
-  const eventName = String(
-  req.get("X-Event-Name") ||
-  req.get("x-event-name") ||
-  payload?.meta?.event_name ||
-  payload?.event_name ||
-  "unknown"
-).trim();
-
-let eventId = String(
-  req.get("X-Event-Id") ||
-  req.get("x-event-id") ||
-  payload?.meta?.event_id ||
-  payload?.meta?.eventId ||
-  ""
-).trim();
-
-// fallback béton si Lemon ne fournit pas l’ID (rare)
-if (!eventId) {
-  eventId = crypto.createHash("sha256").update(req.rawBody || Buffer.from("")).digest("hex");
-}
-
   const receivedAt = new Date();
 
   try {
@@ -965,6 +968,7 @@ if (!eventId) {
     }
 
     const { eventName, deliveryId, resourceId } = extractWebhookBasics(req, payload);
+    const eventLower = String(eventName || "").toLowerCase();
 
     await initDb();
     const pool = getPool();
@@ -978,7 +982,6 @@ if (!eventId) {
       RETURNING id
       `,
       [
-        // event_id historique: on met deliveryId pour éviter collisions
         String(deliveryId),
         String(eventName),
         receivedAt.toISOString(),
@@ -993,49 +996,22 @@ if (!eventId) {
     }
 
     // Process
-    if (String(eventName).toLowerCase() === "license_key_created") {
+    if (eventLower === "license_key_created" || eventLower === "license_key_updated") {
       await upsertAccessFromLicenseKey(payload);
-    } else if (String(eventName).toLowerCase().startsWith("subscription_")) {
+    } else if (eventLower.startsWith("subscription_")) {
       await updateAccessFromSubscription(eventName, payload);
-    } else if (String(eventName).toLowerCase() === "order_refunded") {
-      // optionnel : revoke si tu veux (à faire plus tard)
     }
 
+    // ✅ marque comme traité (sinon tu vois que des "error" partout)
     await pool.query(
-  `
-  INSERT INTO mg_access (
-    email, customer_id, order_id, subscription_id,
-    license_key, product_sku, status, starts_at, expires_at, meta
-  )
-  VALUES ($1,$2,$3,NULL,$4,$5,'active',$6::timestamptz,$7::timestamptz,$8::jsonb)
-
-  ON CONFLICT (license_key) WHERE license_key IS NOT NULL AND license_key <> ''
-  DO UPDATE SET
-    email = EXCLUDED.email,
-    customer_id = EXCLUDED.customer_id,
-    order_id = EXCLUDED.order_id,
-    status = EXCLUDED.status,
-    starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
-    expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
-    meta = mg_access.meta || EXCLUDED.meta,
-    updated_at = now()
-  `,
-  [
-    email || null,
-    a.customer_id ? String(a.customer_id) : null,
-    a.order_id ? String(a.order_id) : null,
-    licenseKey,
-    productId || null,
-    (a.created_at ? String(a.created_at) : new Date().toISOString()),
-    expiresAt,
-    JSON.stringify(meta),
-  ]
-);
-
+      `UPDATE mg_webhook_events SET processed_at=now(), status='processed', error=NULL WHERE delivery_id=$1`,
+      [String(deliveryId)]
+    );
 
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error("[/webhooks/lemon] ERROR:", e?.message || e);
+
     try {
       const pool = getPool();
       if (pool) {
@@ -1046,7 +1022,7 @@ if (!eventId) {
         );
       }
     } catch {}
-    // 200 pour éviter retry infini Lemon
+
     return res.status(200).json({ ok: true });
   }
 });

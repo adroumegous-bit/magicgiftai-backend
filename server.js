@@ -542,7 +542,7 @@ function extractClientLicenseKey(req) {
   );
 }
 
-async function requireAccess(req, res, next) {}
+async function requireAccess(req, res, next) {
   try {
     if (!ACCESS_REQUIRED) return next();
     const key = extractClientLicenseKey(req);
@@ -565,7 +565,7 @@ async function requireAccess(req, res, next) {}
     promptVersion: PROMPT_VERSION,
   });
 }
-
+}
 
 /* ==========================
    Util: extraire texte Responses API

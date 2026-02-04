@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.9-2026-02-04";
+const PROMPT_VERSION = "v5.10-2026-02-04";
 
 const express = require("express");
 const cors = require("cors");
@@ -388,6 +388,24 @@ async function upsertAccessFromLicenseKey(payload) {
   const a = payload?.data?.attributes || {};
   const productId = String(a.product_id || "");
   const licenseKey = String(a.key || "").trim();
+  if (!licenseKey) return;
+  await pool.query(
+  `
+  INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
+  VALUES ($1,$2,$3,NULL,$4,$5,'active',$6,$7,$8::jsonb, now())
+  ON CONFLICT (license_key)
+  DO UPDATE SET
+    email = EXCLUDED.email,
+    customer_id = EXCLUDED.customer_id,
+    order_id = EXCLUDED.order_id,
+    status = EXCLUDED.status,
+    starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
+    expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
+    meta = mg_access.meta || EXCLUDED.meta,
+    updated_at = now()
+  `,
+);
+
   const email = String(a.user_email || "").toLowerCase().trim();
 
   if (!licenseKey) return;
@@ -398,6 +416,8 @@ async function upsertAccessFromLicenseKey(payload) {
   if (!expiresAt && MG_PRODUCT_48H_ID && productId === MG_PRODUCT_48H_ID) {
     expiresAt = addHours(a.created_at || new Date().toISOString(), MG_48H_HOURS);
   }
+
+ 
 
   const meta = {
     product_id: a.product_id || null,
@@ -968,8 +988,7 @@ app.post("/webhooks/lemon", async (req, res) => {
     }
 
     const { eventName, deliveryId, resourceId } = extractWebhookBasics(req, payload);
-    const eventLower = String(eventName || "").toLowerCase();
-
+  
     await initDb();
     const pool = getPool();
     if (!pool) return res.status(500).send("DB disabled");
@@ -996,6 +1015,8 @@ app.post("/webhooks/lemon", async (req, res) => {
     }
 
     // Process
+    const eventLower = String(eventName || "").toLowerCase();
+
     if (eventLower === "license_key_created" || eventLower === "license_key_updated") {
       await upsertAccessFromLicenseKey(payload);
     } else if (eventLower.startsWith("subscription_")) {

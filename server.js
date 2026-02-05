@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.11-2026-02-04";
+const PROMPT_VERSION = "v5.12-2026-02-04";
 
 const express = require("express");
 const cors = require("cors");
@@ -446,7 +446,7 @@ async function updateAccessFromSubscription(eventName, payload) {
 const renewsAt = a.renews_at ? String(a.renews_at) : null;
 
 // paidThrough = date jusqu'à laquelle c'est payé
-const paidThrough = renewsAt || endsAt || null;
+const paidThrough = endsAt || renewsAt || null;
 
 
   let status = "active";
@@ -484,12 +484,20 @@ const paidThrough = renewsAt || endsAt || null;
     renews_at = $5::timestamptz,
     -- expires_at = date de fin de droit (ends_at ou renews_at)
     expires_at = COALESCE($6::timestamptz, expires_at),
-    -- status = active tant que expires_at est futur (même si cancelled)
+
+    -- ✅ status = ton statut d'accès (cohérent avec checkAccessKey)
     status = CASE
-      WHEN COALESCE($6::timestamptz, expires_at) IS NULL THEN status
-      WHEN now() < COALESCE($6::timestamptz, expires_at) THEN 'active'
-      ELSE 'expired'
+      WHEN $2::text IN ('unpaid','expired') THEN 'expired'
+      WHEN $2::text = 'paused' THEN 'paused'
+      WHEN $3::boolean = true OR $2::text = 'cancelled' THEN
+        CASE
+          WHEN COALESCE($6::timestamptz, expires_at) IS NULL THEN 'cancelled'
+          WHEN now() < COALESCE($6::timestamptz, expires_at) THEN 'cancelled'
+          ELSE 'expired'
+        END
+      ELSE 'active'
     END,
+
     meta = mg_access.meta || $7::jsonb,
     updated_at = now()
   WHERE
@@ -519,7 +527,7 @@ async function checkAccessKey(licenseKey) {
 
   const r = await pool.query(
     `
-    SELECT status, expires_at, cancelled
+    SELECT status, expires_at
     FROM mg_access
     WHERE license_key = $1
     LIMIT 1
@@ -532,26 +540,33 @@ async function checkAccessKey(licenseKey) {
   const row = r.rows[0];
   const st = String(row.status || "").toLowerCase();
   const exp = row.expires_at ? new Date(row.expires_at) : null;
+
+  // petite marge anti-lag (optionnel mais conseillé)
   const now = new Date();
+  const GRACE_MS = 60 * 1000; // 60s
+  const nowGrace = new Date(now.getTime() - GRACE_MS);
 
-  const isCancelled = row.cancelled === true || st === "cancelled";
+  // 1) Si expires_at existe et est passé => KO (peu importe le statut)
+  if (exp && nowGrace >= exp) return { ok: false, reason: "expired" };
 
-  // 1) Si on a une date d'expiration et qu'elle est passée => KO (quel que soit le statut)
-  if (exp && now >= exp) return { ok: false, reason: "expired" };
+  // 2) Statuts interdits (tu peux en ajouter)
+  if (["expired", "revoked", "refunded", "chargeback", "unpaid"].includes(st)) {
+    return { ok: false, reason: "not_active" };
+  }
 
-  // 2) Cas annulé : OK uniquement si expires_at existe (sinon trop risqué)
-  //    (si exp est null => tu ne sais pas jusqu'à quand il a payé)
-  if (isCancelled) {
+  // 3) Cancelled: OK uniquement si expires_at existe et n'est pas passé
+  if (st === "cancelled") {
     if (!exp) return { ok: false, reason: "cancelled_no_expiry" };
     return { ok: true };
   }
 
-  // 3) Cas normal : uniquement "active"
-  if (st !== "active") return { ok: false, reason: "not_active" };
+  // 4) Active: OK (avec ou sans exp)
+  if (st === "active") return { ok: true };
 
-  // 4) Active sans exp => OK (ex: lifetime / cas legacy)
-  return { ok: true };
+  // 5) Tout le reste -> KO
+  return { ok: false, reason: "not_active" };
 }
+
 
   
 function extractClientLicenseKey(req) {

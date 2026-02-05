@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.10-2026-02-04";
+const PROMPT_VERSION = "v5.11-2026-02-04";
 
 const express = require("express");
 const cors = require("cors");
@@ -442,10 +442,12 @@ async function updateAccessFromSubscription(eventName, payload) {
   const lemonStatus = String(a.status || "").toLowerCase();
   const cancelled = Boolean(a.cancelled) || String(eventName || "").toLowerCase() === "subscription_cancelled";
 
-  // paid-through date (fin de période)
   const endsAt = a.ends_at ? String(a.ends_at) : null;
-  const renewsAt = a.renews_at ? String(a.renews_at) : null;
-  const paidThrough = endsAt || renewsAt || null;
+const renewsAt = a.renews_at ? String(a.renews_at) : null;
+
+// paidThrough = date jusqu'à laquelle c'est payé
+const paidThrough = renewsAt || endsAt || null;
+
 
   let status = "active";
 
@@ -517,7 +519,7 @@ async function checkAccessKey(licenseKey) {
 
   const r = await pool.query(
     `
-    SELECT status, expires_at,cancelled
+    SELECT status, expires_at, cancelled
     FROM mg_access
     WHERE license_key = $1
     LIMIT 1
@@ -530,25 +532,27 @@ async function checkAccessKey(licenseKey) {
   const row = r.rows[0];
   const st = String(row.status || "").toLowerCase();
   const exp = row.expires_at ? new Date(row.expires_at) : null;
-  const cancelled = row.cancelled === true;
-
   const now = new Date();
 
-  // Si abonnement annulé, on accepte tant que expires_at est futur
-  if (cancelled) {
+  const isCancelled = row.cancelled === true || st === "cancelled";
+
+  // 1) Si on a une date d'expiration et qu'elle est passée => KO (quel que soit le statut)
+  if (exp && now >= exp) return { ok: false, reason: "expired" };
+
+  // 2) Cas annulé : OK uniquement si expires_at existe (sinon trop risqué)
+  //    (si exp est null => tu ne sais pas jusqu'à quand il a payé)
+  if (isCancelled) {
     if (!exp) return { ok: false, reason: "cancelled_no_expiry" };
-    if (now > exp) return { ok: false, reason: "expired" };
     return { ok: true };
   }
 
-  // autorisés
+  // 3) Cas normal : uniquement "active"
   if (st !== "active") return { ok: false, reason: "not_active" };
 
-  // expiré si exp existe et passée
-  if (exp && now > exp) return { ok: false, reason: "expired" };
-
+  // 4) Active sans exp => OK (ex: lifetime / cas legacy)
   return { ok: true };
 }
+
   
 function extractClientLicenseKey(req) {
   return (

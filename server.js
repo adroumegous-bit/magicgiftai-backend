@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.14-2026-02-06";
+const PROMPT_VERSION = "v5.15-2026-02-06";
 
 const express = require("express");
 const cors = require("cors");
@@ -146,11 +146,22 @@ async function ensureAccessTables() {
   await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS cancelled BOOLEAN NOT NULL DEFAULT false;`).catch(() => {});
   await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ;`).catch(() => {});
   await pool.query(`ALTER TABLE mg_access ADD COLUMN IF NOT EXISTS renews_at TIMESTAMPTZ;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS email TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS order_id TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS customer_id TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS subscription_id TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS license_key TEXT;`).catch(() => {});
+  await pool.query(`ALTER TABLE mg_webhook_events ADD COLUMN IF NOT EXISTS product_id TEXT;`).catch(() => {});
 
   // Unique sur delivery_id (pas sur resource_id !)
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS mg_webhook_events_delivery_id_ux ON mg_webhook_events (delivery_id);`).catch(() => {});
   await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_event_name_idx ON mg_webhook_events (event_name);`).catch(() => {});
   await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_received_at_idx ON mg_webhook_events (received_at DESC);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_email_idx ON mg_webhook_events (email);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_order_id_idx ON mg_webhook_events (order_id);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_subscription_id_idx ON mg_webhook_events (subscription_id);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_license_key_idx ON mg_webhook_events (license_key);`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS mg_webhook_events_customer_id_idx ON mg_webhook_events (customer_id);`).catch(() => {});
 
   // ---- mg_access : on force les colonnes utiles même si table déjà existante ----
   await pool.query(`
@@ -375,6 +386,33 @@ function extractWebhookBasics(req, payload) {
   const resourceId = pickFirst(payload?.data?.id, payload?.data?.attributes?.order_id, payload?.data?.attributes?.subscription_id);
 
   return { eventName, deliveryId, resourceId: resourceId ? String(resourceId) : null };
+
+  function extractDebugFieldsFromPayload(payload) {
+  const a = payload?.data?.attributes || {};
+
+  const email = pickFirst(
+    a.user_email,
+    a.email,
+    payload?.meta?.customer_email,
+    payload?.meta?.email
+  );
+
+  const orderId = pickFirst(a.order_id, payload?.meta?.order_id);
+  const customerId = pickFirst(a.customer_id, payload?.meta?.customer_id);
+  const subscriptionId = pickFirst(a.subscription_id, payload?.data?.id);
+  const licenseKey = pickFirst(a.key);
+  const productId = pickFirst(a.product_id);
+
+  return {
+    email: email ? String(email).toLowerCase().trim() : null,
+    order_id: orderId ? String(orderId) : null,
+    customer_id: customerId ? String(customerId) : null,
+    subscription_id: subscriptionId ? String(subscriptionId) : null,
+    license_key: licenseKey ? String(licenseKey).trim() : null,
+    product_id: productId ? String(productId) : null,
+  };
+}
+
   function extractCorrelation(payload) {
   const a = payload?.data?.attributes || {};
 
@@ -1064,20 +1102,20 @@ app.post("/webhooks/lemon", async (req, res) => {
     await initDb();
     const pool = getPool();
     if (!pool) return res.status(500).send("DB disabled");
-
+    const dbg = extractDebugFieldsFromPayload(payload);
     const ins = await pool.query(
-      `
-       INSERT INTO mg_webhook_events (
+  `
+  INSERT INTO mg_webhook_events (
     event_id, event_name, received_at,
-    delivery_id, resource_id, payload, status,
-    order_id, subscription_id, license_key, email,
-    customer_id, product_id, variant_id, correlation_key
+    delivery_id, resource_id,
+    email, order_id, customer_id, subscription_id, license_key, product_id,
+    payload, status
   )
   VALUES (
     $1,$2,$3,
-    $4,$5,$6::jsonb,'received',
-    $7,$8,$9,$10,
-    $11,$12,$13,$14
+    $4,$5,
+    $6,$7,$8,$9,$10,$11,
+    $12::jsonb,'received'
   )
   ON CONFLICT (delivery_id) DO NOTHING
   RETURNING id
@@ -1088,12 +1126,15 @@ app.post("/webhooks/lemon", async (req, res) => {
         receivedAt.toISOString(),
         String(deliveryId),
         resourceId,
-        JSON.stringify(payload),
 
-        c.customerId,
-        c.productId,
-        c.variantId,
-        c.correlationKey,
+        dbg.email,
+        dbg.order_id,
+        dbg.customer_id,
+        dbg.subscription_id,
+        dbg.license_key,
+        dbg.product_id,
+
+        JSON.stringify(payload),
       ]
     );
 

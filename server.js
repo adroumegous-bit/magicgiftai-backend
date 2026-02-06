@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.12-2026-02-04";
+const PROMPT_VERSION = "v5.13-2026-02-06";
 
 const express = require("express");
 const cors = require("cors");
@@ -388,36 +388,18 @@ async function upsertAccessFromLicenseKey(payload) {
   const a = payload?.data?.attributes || {};
   const productId = String(a.product_id || "");
   const licenseKey = String(a.key || "").trim();
-  if (!licenseKey) return;
-  await pool.query(
-  `
-  INSERT INTO mg_access (email, customer_id, order_id, subscription_id, license_key, product_sku, status, starts_at, expires_at, meta, updated_at)
-  VALUES ($1,$2,$3,NULL,$4,$5,'active',$6,$7,$8::jsonb, now())
-  ON CONFLICT (license_key)
-  DO UPDATE SET
-    email = EXCLUDED.email,
-    customer_id = EXCLUDED.customer_id,
-    order_id = EXCLUDED.order_id,
-    status = EXCLUDED.status,
-    starts_at = COALESCE(EXCLUDED.starts_at, mg_access.starts_at),
-    expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
-    meta = mg_access.meta || EXCLUDED.meta,
-    updated_at = now()
-  `,
-);
-
-  const email = String(a.user_email || "").toLowerCase().trim();
+  const email = String(a.user_email || "").toLowerCase().trim() || null;
 
   if (!licenseKey) return;
 
   let expiresAt = a.expires_at ? String(a.expires_at) : null;
 
-  // 48h : Lemon ne met pas forcément expires_at, donc on calcule
+  // Essai 48h : si Lemon ne donne pas expires_at, on le calcule
   if (!expiresAt && MG_PRODUCT_48H_ID && productId === MG_PRODUCT_48H_ID) {
     expiresAt = addHours(a.created_at || new Date().toISOString(), MG_48H_HOURS);
   }
 
- 
+  const startsAt = a.created_at ? String(a.created_at) : new Date().toISOString();
 
   const meta = {
     product_id: a.product_id || null,
@@ -425,11 +407,43 @@ async function upsertAccessFromLicenseKey(payload) {
     customer_id: a.customer_id || null,
     created_at: a.created_at || null,
     lemon_status: a.status || null,
-    // utile debug
     source_event: "license_key_created",
   };
-}
 
+  const sql = `
+    INSERT INTO mg_access (
+      email, customer_id, order_id, subscription_id,
+      license_key, product_sku, status, starts_at, expires_at, meta, updated_at
+    )
+    VALUES (
+      $1::text, $2::text, $3::text, NULL,
+      $4::text, $5::text, 'active', $6::timestamptz, $7::timestamptz, $8::jsonb, now()
+    )
+    ON CONFLICT (license_key)
+    DO UPDATE SET
+      email = EXCLUDED.email,
+      customer_id = EXCLUDED.customer_id,
+      order_id = EXCLUDED.order_id,
+      product_sku = COALESCE(EXCLUDED.product_sku, mg_access.product_sku),
+      starts_at = COALESCE(mg_access.starts_at, EXCLUDED.starts_at),
+      expires_at = COALESCE(EXCLUDED.expires_at, mg_access.expires_at),
+      status = 'active',
+      meta = mg_access.meta || EXCLUDED.meta,
+      updated_at = now()
+  `;
+
+  // IMPORTANT: params bien fournis => plus jamais "no parameter $1"
+  await pool.query(sql, [
+    email,
+    a.customer_id ? String(a.customer_id) : null,
+    a.order_id ? String(a.order_id) : null,
+    licenseKey,
+    productId || null,     // tu stockes product_id dans product_sku
+    startsAt,
+    expiresAt,
+    JSON.stringify(meta),
+  ]);
+}
 
 async function updateAccessFromSubscription(eventName, payload) {
   const pool = getPool();
@@ -1050,7 +1064,7 @@ app.post("/webhooks/lemon", async (req, res) => {
 
     return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error("[/webhooks/lemon] ERROR:", e?.message || e);
+    console.error("[/webhooks/lemon] ERROR:", e?.stack || e?.message || e);
 
     try {
       const pool = getPool();

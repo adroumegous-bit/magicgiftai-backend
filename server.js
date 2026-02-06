@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.15-2026-02-06";
+const PROMPT_VERSION = "v5.16-2026-02-06";
 
 const express = require("express");
 const cors = require("cors");
@@ -1087,13 +1087,32 @@ app.get("/admin/db-ping", requireAdmin, async (req, res) => {
 
 // ✅ Webhook Lemon UNIQUE (plus de doublons)
 app.post("/webhooks/lemon", async (req, res) => {
+app.post("/webkooks/lemon", (req, res, next) => app._router.handle(req, res, next)); // alias si Lemon pointe encore là
+app.post("/webhooks/lemon/", (req, res, next) => app._router.handle(req, res, next)); // slash final
+
   const payload = req.body || {};
+  console.log("[LEMON] HIT", {
+  at: new Date().toISOString(),
+  path: req.path,
+  method: req.method,
+  hasRawBody: !!req.rawBody,
+  rawLen: req.rawBody ? req.rawBody.length : 0,
+  eventNameHdr: req.get("X-Event-Name") || req.get("x-event-name") || null,
+  eventIdHdr: req.get("X-Event-Id") || req.get("x-event-id") || null,
+});
+
   const receivedAt = new Date();
 
   try {
     const v = verifyLemonSignature(req);
     if (!v.ok) {
       console.warn("[LEMON] invalid signature:", v.reason);
+      console.warn("[LEMON] SIGNATURE FAIL", {
+  reason: v.reason,
+  sig: String(req.get("X-Signature") || req.get("x-signature") || "").slice(0, 20) + "...",
+  secretLoaded: !!LEMON_WEBHOOK_SECRET,
+});
+
       return res.status(401).send("Bad signature");
     }
 

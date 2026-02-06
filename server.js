@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.13-2026-02-06";
+const PROMPT_VERSION = "v5.14-2026-02-06";
 
 const express = require("express");
 const cors = require("cors");
@@ -375,6 +375,45 @@ function extractWebhookBasics(req, payload) {
   const resourceId = pickFirst(payload?.data?.id, payload?.data?.attributes?.order_id, payload?.data?.attributes?.subscription_id);
 
   return { eventName, deliveryId, resourceId: resourceId ? String(resourceId) : null };
+  function extractCorrelation(payload) {
+  const a = payload?.data?.attributes || {};
+
+  const orderId =
+    a.order_id ? String(a.order_id) :
+    payload?.meta?.order_id ? String(payload.meta.order_id) :
+    null;
+
+  const subscriptionId =
+    a.subscription_id ? String(a.subscription_id) :
+    payload?.data?.id ? String(payload.data.id) :
+    null;
+
+  const licenseKey =
+    a.key ? String(a.key).trim() :
+    null;
+
+  const email =
+    a.user_email ? String(a.user_email).toLowerCase().trim() :
+    a.email ? String(a.email).toLowerCase().trim() :
+    null;
+
+  const customerId =
+    a.customer_id ? String(a.customer_id) :
+    null;
+
+  const productId =
+    a.product_id ? String(a.product_id) :
+    null;
+
+  const variantId =
+    a.variant_id ? String(a.variant_id) :
+    null;
+
+  const correlationKey =
+    licenseKey || orderId || subscriptionId || email || customerId || null;
+
+  return { orderId, subscriptionId, licenseKey, email, customerId, productId, variantId, correlationKey };
+}
 }
 
 /* ==========================
@@ -1028,10 +1067,20 @@ app.post("/webhooks/lemon", async (req, res) => {
 
     const ins = await pool.query(
       `
-      INSERT INTO mg_webhook_events (event_id, event_name, received_at, delivery_id, resource_id, payload, status)
-      VALUES ($1,$2,$3,$4,$5,$6::jsonb,'received')
-      ON CONFLICT (delivery_id) DO NOTHING
-      RETURNING id
+       INSERT INTO mg_webhook_events (
+    event_id, event_name, received_at,
+    delivery_id, resource_id, payload, status,
+    order_id, subscription_id, license_key, email,
+    customer_id, product_id, variant_id, correlation_key
+  )
+  VALUES (
+    $1,$2,$3,
+    $4,$5,$6::jsonb,'received',
+    $7,$8,$9,$10,
+    $11,$12,$13,$14
+  )
+  ON CONFLICT (delivery_id) DO NOTHING
+  RETURNING id
       `,
       [
         String(deliveryId),
@@ -1040,6 +1089,11 @@ app.post("/webhooks/lemon", async (req, res) => {
         String(deliveryId),
         resourceId,
         JSON.stringify(payload),
+
+        c.customerId,
+        c.productId,
+        c.variantId,
+        c.correlationKey,
       ]
     );
 

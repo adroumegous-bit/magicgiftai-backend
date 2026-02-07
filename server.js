@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.16-2026-02-06";
+const PROMPT_VERSION = "v5.17-2026-02-07";
 
 const express = require("express");
 const cors = require("cors");
@@ -1156,6 +1156,8 @@ app.post("/webhooks/lemon/", (req, res, next) => app._router.handle(req, res, ne
         JSON.stringify(payload),
       ]
     );
+      console.log("[LEMON] EVENT STORED", ins && typeof ins.rowCount === "number" ? ins.rowCount : "no-ins");
+    
 
     if (ins.rowCount === 0) {
       return res.status(200).json({ ok: true, duplicate: true });

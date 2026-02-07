@@ -1123,8 +1123,6 @@ function extractDebugFieldsFromPayload(payload) {
 
 // ✅ Webhook Lemon UNIQUE (plus de doublons)
 app.post("/webhooks/lemon", async (req, res) => {
-  console.log("[LEMON] HIT", new Date().toISOString());
-
 app.post("/webkooks/lemon", (req, res, next) => app._router.handle(req, res, next)); // alias si Lemon pointe encore là
 app.post("/webhooks/lemon/", (req, res, next) => app._router.handle(req, res, next)); // slash final
 

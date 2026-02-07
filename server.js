@@ -1,6 +1,6 @@
 "use strict";
 
-const PROMPT_VERSION = "v5.17-2026-02-07";
+const PROMPT_VERSION = "v5.18-2026-02-07";
 
 const express = require("express");
 const cors = require("cors");
@@ -1084,6 +1084,42 @@ app.get("/admin/db-ping", requireAdmin, async (req, res) => {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
+
+function extractDebugFieldsFromPayload(payload) {
+  const a = payload?.data?.attributes || {};
+
+  // license_key_created
+  const email =
+    pickFirst(a.user_email, a.email, payload?.meta?.customer_email) || null;
+
+  const order_id =
+    pickFirst(a.order_id, payload?.data?.attributes?.order_id) || null;
+
+  const customer_id =
+    pickFirst(a.customer_id, payload?.meta?.customer_id) || null;
+
+  // subscription_*
+  const subscription_id =
+    pickFirst(payload?.data?.id, a.subscription_id) || null;
+
+  // license key events
+  const license_key =
+    pickFirst(a.key, a.license_key) || null;
+
+  // product / variant
+  const product_id =
+    pickFirst(a.product_id, a.variant_id) || null;
+
+  return {
+    email: email ? String(email).toLowerCase().trim() : null,
+    order_id: order_id ? String(order_id) : null,
+    customer_id: customer_id ? String(customer_id) : null,
+    subscription_id: subscription_id ? String(subscription_id) : null,
+    license_key: license_key ? String(license_key).trim() : null,
+    product_id: product_id ? String(product_id) : null,
+  };
+}
+
 
 // ✅ Webhook Lemon UNIQUE (plus de doublons)
 app.post("/webhooks/lemon", async (req, res) => {
